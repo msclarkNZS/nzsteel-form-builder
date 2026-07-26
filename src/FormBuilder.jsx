@@ -705,24 +705,9 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
 }
 
 // ─── PDF import modal ─────────────────────────────────────────────────────────
-function PdfImportModal({onImport,onClose}){
-  const [status,setStatus]=useState("idle");
-  const [log,setLog]=useState("");
-  const [dragOver,setDragOver]=useState(false);
-  const fileRef=useRef();
-
-  const processFile=async file=>{
-    if(!file||file.type!=="application/pdf"){setStatus("error");setLog("Please select a PDF file.");return;}
-    setStatus("loading");setLog("Reading PDF…");
-    const toB64=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(",")[1]);r.onerror=rej;r.readAsDataURL(f);});
-    try{
-      const b64=await toB64(file);
-      setLog("Sending to Claude for analysis…");
-      const resp=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:8192,messages:[{role:"user",content:[
-          {type:"document",source:{type:"base64",media_type:"application/pdf",data:b64}},
-          {type:"text",text:`You are a form digitisation assistant. Analyse this PDF check sheet and extract its structure.
+// Shared extraction prompt — used both for the (currently disabled) direct
+// API path and shown to the user to paste into a Claude chat manually.
+const PDF_EXTRACTION_PROMPT = `You are a form digitisation assistant. Analyse this PDF check sheet and extract its structure.
 
 Return ONLY a raw JSON object. Start with { end with }. No markdown, no commentary.
 
@@ -755,56 +740,142 @@ responseTypes: pick one or more from: checkbox, passfail, number, text, photo, r
 - text = comment, note, observation
 - photo = photograph or visual evidence required
 - rating = score or scale
-For items needing result + comment use ["passfail","text"]. Extract ALL checks, preserve ALL sections.`}
+For items needing result + comment use ["passfail","text"]. Extract ALL checks, preserve ALL sections.`;
+
+// Shared JSON extraction + repair — handles markdown fences, stray preamble,
+// and truncated output regardless of where the JSON text came from.
+function extractAndRepairJson(str){
+  const start=str.indexOf("{");
+  if(start===-1) throw new Error("No JSON object found — make sure you copied Claude's full reply.");
+  let depth=0,end=-1;
+  for(let i=start;i<str.length;i++){if(str[i]==="{")depth++;else if(str[i]==="}"){depth--;if(depth===0){end=i;break;}}}
+  const js=end!==-1?str.slice(start,end+1):str.slice(start);
+  try{return JSON.parse(js);}catch(_){}
+  let rep=js;const stack=[];let inStr=false,esc=false;
+  for(let i=0;i<rep.length;i++){const ch=rep[i];if(esc){esc=false;continue;}if(ch==="\\"){esc=true;continue;}if(ch==='"'){inStr=!inStr;continue;}if(inStr)continue;if(ch==="{"||ch==="[")stack.push(ch);else if(ch==="}"||ch==="]")stack.pop();}
+  rep=rep.replace(/,\s*$/,"").replace(/:\s*$/,": null").trimEnd();
+  if(inStr)rep+='"';
+  for(let i=stack.length-1;i>=0;i--)rep+=stack[i]==="["?"]":"}";
+  try{return JSON.parse(rep);}catch(e){throw new Error("Couldn't parse that as JSON: "+e.message);}
+}
+
+function hydrateImportedForm(parsed){
+  return {...parsed,id:uid(),status:"draft",approvals:[],tags:[],version:parsed.version||"1.0",createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),
+    sections:(parsed.sections||[]).map(s=>({...s,id:uid(),fields:(s.fields||[]).map(f=>({...newField(),...f,id:uid(),responseTypes:Array.isArray(f.responseTypes)&&f.responseTypes.length?f.responseTypes:["checkbox"]}))}))};
+}
+
+function PdfImportModal({onImport,onClose}){
+  const [mode,setMode]=useState("paste"); // paste | upload
+  const [status,setStatus]=useState("idle");
+  const [log,setLog]=useState("");
+  const [dragOver,setDragOver]=useState(false);
+  const [pasted,setPasted]=useState("");
+  const [copied,setCopied]=useState(false);
+  const fileRef=useRef();
+
+  const copyPrompt=()=>{
+    navigator.clipboard.writeText(PDF_EXTRACTION_PROMPT);
+    setCopied(true);
+    setTimeout(()=>setCopied(false),2000);
+  };
+
+  const importPasted=()=>{
+    setStatus("loading");setLog("Parsing…");
+    try{
+      const parsed=extractAndRepairJson(pasted);
+      const fc=parsed.sections?.reduce((a,s)=>a+(s.fields?.length||0),0)||0;
+      setLog(`Done! Imported ${fc} checks across ${parsed.sections?.length||0} sections.`);
+      setStatus("done");
+      const hydrated=hydrateImportedForm(parsed);
+      setTimeout(()=>onImport(hydrated),500);
+    }catch(err){setStatus("error");setLog(err.message);}
+  };
+
+  const processFile=async file=>{
+    if(!file||file.type!=="application/pdf"){setStatus("error");setLog("Please select a PDF file.");return;}
+    setStatus("loading");setLog("Reading PDF…");
+    const toB64=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(",")[1]);r.onerror=rej;r.readAsDataURL(f);});
+    try{
+      const b64=await toB64(file);
+      setLog("Sending to Claude for analysis…");
+      const resp=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:8192,messages:[{role:"user",content:[
+          {type:"document",source:{type:"base64",media_type:"application/pdf",data:b64}},
+          {type:"text",text:PDF_EXTRACTION_PROMPT}
         ]}]})
       });
       const data=await resp.json();
       if(!resp.ok) throw new Error(data.error?.message||"API error");
       const raw=data.content.map(c=>c.text||"").join("");
-      const extractAndRepair=str=>{
-        const start=str.indexOf("{");
-        if(start===-1) throw new Error("No JSON found");
-        let depth=0,end=-1;
-        for(let i=start;i<str.length;i++){if(str[i]==="{")depth++;else if(str[i]==="}"){depth--;if(depth===0){end=i;break;}}}
-        const js=end!==-1?str.slice(start,end+1):str.slice(start);
-        try{return JSON.parse(js);}catch(_){}
-        let rep=js;const stack=[];let inStr=false,esc=false;
-        for(let i=0;i<rep.length;i++){const ch=rep[i];if(esc){esc=false;continue;}if(ch==="\\"){esc=true;continue;}if(ch==='"'){inStr=!inStr;continue;}if(inStr)continue;if(ch==="{"||ch==="[")stack.push(ch);else if(ch==="}"||ch==="]")stack.pop();}
-        rep=rep.replace(/,\s*$/,"").replace(/:\s*$/,": null").trimEnd();
-        if(inStr)rep+='"';
-        for(let i=stack.length-1;i>=0;i--)rep+=stack[i]==="["?"]":"}";
-        try{return JSON.parse(rep);}catch(e){throw new Error("Parse failed: "+e.message);}
-      };
-      const parsed=extractAndRepair(raw);
+      const parsed=extractAndRepairJson(raw);
       const fc=parsed.sections?.reduce((a,s)=>a+(s.fields?.length||0),0)||0;
       setLog(`Done! Imported ${fc} checks across ${parsed.sections?.length||0} sections.`);
       setStatus("done");
-      const hydrated={...parsed,id:uid(),status:"draft",approvals:[],tags:[],version:parsed.version||"1.0",createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),
-        sections:(parsed.sections||[]).map(s=>({...s,id:uid(),fields:(s.fields||[]).map(f=>({...newField(),...f,id:uid(),responseTypes:Array.isArray(f.responseTypes)&&f.responseTypes.length?f.responseTypes:["checkbox"]}))}))};
+      const hydrated=hydrateImportedForm(parsed);
       setTimeout(()=>onImport(hydrated),600);
-    }catch(err){setStatus("error");setLog("Error: "+err.message);}
+    }catch(err){setStatus("error");setLog("Error: "+err.message+" — this path needs an Anthropic API key wired up via a server-side proxy. Use \"Paste from Claude\" instead for now.");}
   };
 
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.6)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}>
-      <Card style={{width:480,padding:28}}>
+      <Card style={{width:560,padding:28,maxHeight:"88vh",overflowY:"auto"}}>
         <div style={{fontSize:18,fontWeight:700,marginBottom:4,color:C.text}}>Import from PDF</div>
-        <div style={{fontSize:13,color:C.textSec,marginBottom:20}}>Claude will read your check sheet and extract all sections and checks automatically. You can edit the result after.</div>
-        {status==="idle"&&(
-          <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={e=>{e.preventDefault();setDragOver(false);processFile(e.dataTransfer.files[0]);}} onClick={()=>fileRef.current.click()}
-            style={{border:`2px dashed ${dragOver?C.indigo:C.border}`,borderRadius:12,padding:"40px 24px",textAlign:"center",cursor:"pointer",background:dragOver?C.indigoLight:C.bg,transition:"all 0.15s"}}>
-            <div style={{fontSize:40,marginBottom:10}}>📄</div>
-            <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:4}}>Drop PDF here or click to browse</div>
-            <div style={{fontSize:12,color:C.textMut}}>Works with scanned and digital PDFs</div>
-            <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])}/>
+        <div style={{fontSize:13,color:C.textSec,marginBottom:16}}>Turn a paper check sheet into a form. Choose how below.</div>
+
+        {/* Mode toggle */}
+        <div style={{display:"flex",gap:6,marginBottom:18,padding:4,background:C.slateLight,borderRadius:10}}>
+          <button onClick={()=>{setMode("paste");setStatus("idle");}} style={{flex:1,padding:"7px 10px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:600,background:mode==="paste"?"#fff":"transparent",color:mode==="paste"?C.indigo:C.textSec,boxShadow:mode==="paste"?C.shadow:"none"}}>📋 Paste from Claude</button>
+          <button onClick={()=>{setMode("upload");setStatus("idle");}} style={{flex:1,padding:"7px 10px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:600,background:mode==="upload"?"#fff":"transparent",color:mode==="upload"?C.indigo:C.textSec,boxShadow:mode==="upload"?C.shadow:"none"}}>📄 Direct upload</button>
+        </div>
+
+        {mode==="paste"&&(
+          <div>
+            <div style={{fontSize:12,color:C.textSec,marginBottom:12,lineHeight:1.6}}>
+              <strong style={{color:C.text}}>1.</strong> Open a chat with Claude (claude.ai) and upload your PDF check sheet there.<br/>
+              <strong style={{color:C.text}}>2.</strong> Copy the prompt below and send it along with the PDF.<br/>
+              <strong style={{color:C.text}}>3.</strong> Copy Claude's JSON reply and paste it into the box underneath.
+            </div>
+            <div style={{position:"relative",marginBottom:14}}>
+              <pre style={{margin:0,padding:"12px 14px",background:"#0f172a",color:"#67e8f9",fontSize:10.5,lineHeight:1.5,borderRadius:8,maxHeight:120,overflowY:"auto",fontFamily:"monospace",whiteSpace:"pre-wrap"}}>{PDF_EXTRACTION_PROMPT}</pre>
+              <button onClick={copyPrompt} style={{position:"absolute",top:8,right:8,padding:"4px 10px",borderRadius:6,border:"none",cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit",background:copied?C.green:"#334155",color:"#fff"}}>{copied?"✓ Copied":"Copy prompt"}</button>
+            </div>
+            <label style={lbl}>Paste Claude's JSON reply here</label>
+            <Textarea value={pasted} onChange={e=>setPasted(e.target.value)} placeholder="{ &quot;title&quot;: ...}" style={{minHeight:140,fontFamily:"monospace",fontSize:11.5}}/>
+            {status!=="idle"&&(
+              <div style={{marginTop:12,padding:"12px 16px",borderRadius:10,border:`1px solid ${status==="error"?C.red:status==="done"?C.green:C.border}`,background:status==="error"?C.redLight:status==="done"?C.greenLight:C.bg}}>
+                <div style={{fontSize:13,color:status==="error"?C.red:status==="done"?C.green:C.textSec}}>{status==="loading"&&"⏳ "}{status==="done"&&"✅ "}{status==="error"&&"❌ "}{log}</div>
+              </div>
+            )}
+            <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}}>
+              <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+              <Btn variant="primary" onClick={importPasted} disabled={!pasted.trim()} style={{opacity:pasted.trim()?1:0.5}}>Import</Btn>
+            </div>
           </div>
         )}
-        {status!=="idle"&&(
-          <div style={{padding:"16px 20px",borderRadius:10,border:`1px solid ${status==="error"?C.red:status==="done"?C.green:C.border}`,background:status==="error"?C.redLight:status==="done"?C.greenLight:C.bg}}>
-            <div style={{fontSize:13,color:status==="error"?C.red:status==="done"?C.green:C.textSec}}>{status==="loading"&&"⏳ "}{status==="done"&&"✅ "}{status==="error"&&"❌ "}{log}</div>
+
+        {mode==="upload"&&(
+          <div>
+            <div style={{fontSize:12,color:"#92400e",background:C.amberLight,border:"1px solid #fcd34d",borderRadius:8,padding:"8px 12px",marginBottom:14}}>
+              ⚠️ Needs an Anthropic API key wired up via a server-side proxy — not set up yet. Use "Paste from Claude" for now.
+            </div>
+            {status==="idle"&&(
+              <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={e=>{e.preventDefault();setDragOver(false);processFile(e.dataTransfer.files[0]);}} onClick={()=>fileRef.current.click()}
+                style={{border:`2px dashed ${dragOver?C.indigo:C.border}`,borderRadius:12,padding:"40px 24px",textAlign:"center",cursor:"pointer",background:dragOver?C.indigoLight:C.bg,transition:"all 0.15s"}}>
+                <div style={{fontSize:40,marginBottom:10}}>📄</div>
+                <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:4}}>Drop PDF here or click to browse</div>
+                <div style={{fontSize:12,color:C.textMut}}>Works with scanned and digital PDFs</div>
+                <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])}/>
+              </div>
+            )}
+            {status!=="idle"&&(
+              <div style={{padding:"16px 20px",borderRadius:10,border:`1px solid ${status==="error"?C.red:status==="done"?C.green:C.border}`,background:status==="error"?C.redLight:status==="done"?C.greenLight:C.bg}}>
+                <div style={{fontSize:13,color:status==="error"?C.red:status==="done"?C.green:C.textSec}}>{status==="loading"&&"⏳ "}{status==="done"&&"✅ "}{status==="error"&&"❌ "}{log}</div>
+              </div>
+            )}
+            <div style={{display:"flex",justifyContent:"flex-end",marginTop:16}}><Btn variant="ghost" onClick={onClose}>Cancel</Btn></div>
           </div>
         )}
-        <div style={{display:"flex",justifyContent:"flex-end",marginTop:16}}><Btn variant="ghost" onClick={onClose}>Cancel</Btn></div>
       </Card>
     </div>
   );

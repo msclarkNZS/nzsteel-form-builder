@@ -43,9 +43,13 @@ let _id = 200;
 const uid = () => `f${_id++}`;
 
 const newField = () => ({
-  id:uid(), label:"", helpText:"", refDoc:"", refPhoto:null,
+  id:uid(), kind:"check", label:"", helpText:"", refDoc:"", refPhoto:null,
   required:false, responseTypes:["checkbox"],
   unit:"", min:"", max:"", ratingMax:5, naAllowed:true,
+});
+
+const newInfoField = () => ({
+  ...newField(), kind:"info", responseTypes:[],
 });
 
 const emptyForm = (title="") => ({
@@ -149,30 +153,50 @@ function RefPhotoPicker({value,onChange,onLightbox}){
 // ─── Field card ───────────────────────────────────────────────────────────────
 function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
   const [open,setOpen]=useState(true);
+  const isInfo=field.kind==="info";
   const hasN=field.responseTypes.includes("number");
   const hasR=field.responseTypes.includes("rating");
   const hasPF=field.responseTypes.includes("passfail");
+
+  const toggleKind=()=>{
+    if(isInfo) onChange({...field,kind:"check",responseTypes:field.responseTypes.length?field.responseTypes:["checkbox"]});
+    else onChange({...field,kind:"info",responseTypes:[]});
+  };
+
   return (
     <div draggable onDragStart={dragHandlers.onDragStart} onDragEnter={dragHandlers.onDragEnter} onDragEnd={dragHandlers.onDragEnd} onDragOver={e=>e.preventDefault()} style={{marginBottom:10}}>
-      <Card style={{overflow:"hidden",transition:"box-shadow 0.15s"}} onMouseEnter={e=>e.currentTarget.style.boxShadow=C.shadowMd} onMouseLeave={e=>e.currentTarget.style.boxShadow=C.shadow}>
+      <Card style={{overflow:"hidden",transition:"box-shadow 0.15s",borderColor:isInfo?"#93c5fd":C.border}} onMouseEnter={e=>e.currentTarget.style.boxShadow=C.shadowMd} onMouseLeave={e=>e.currentTarget.style.boxShadow=C.shadow}>
         {/* Header */}
-        <div style={{padding:"11px 14px",display:"flex",alignItems:"center",gap:8,borderBottom:open?`1px solid ${C.border}`:"none",cursor:"pointer",background:open?"#fff":C.slateLight,borderRadius:open?"12px 12px 0 0":12}} onClick={()=>setOpen(o=>!o)}>
+        <div style={{padding:"11px 14px",display:"flex",alignItems:"center",gap:8,borderBottom:open?`1px solid ${C.border}`:"none",cursor:"pointer",background:open?(isInfo?"#eff6ff":"#fff"):C.slateLight,borderRadius:open?"12px 12px 0 0":12}} onClick={()=>setOpen(o=>!o)}>
           <span style={{color:C.textMut,cursor:"grab",fontSize:14,userSelect:"none"}} title="Drag to reorder">⠿</span>
-          <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-            {field.responseTypes.map(rt=>{const d=RESP_TYPES.find(r=>r.type===rt);return <Badge key={rt} color={d.color} bg={d.bg}>{d.icon} {d.label}</Badge>;})}
-          </div>
-          <span style={{flex:1,fontSize:13,color:field.label?C.text:C.textMut,marginLeft:4,fontWeight:field.label?500:400}}>{field.label||"Untitled check"}</span>
+          {isInfo?(
+            <Badge color="#1d4ed8" bg="#dbeafe">ℹ️ Info text</Badge>
+          ):(
+            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+              {field.responseTypes.map(rt=>{const d=RESP_TYPES.find(r=>r.type===rt);return <Badge key={rt} color={d.color} bg={d.bg}>{d.icon} {d.label}</Badge>;})}
+            </div>
+          )}
+          <span style={{flex:1,fontSize:13,color:field.label?C.text:C.textMut,marginLeft:4,fontWeight:field.label?500:400}}>{field.label||(isInfo?"Untitled info block":"Untitled check")}</span>
           {field.refDoc&&(
             <span style={{fontSize:11,fontFamily:"monospace",background:C.amberLight,color:"#92400e",padding:"2px 7px",borderRadius:6,border:"1px solid #fcd34d",flexShrink:0}}>{field.refDoc}</span>
           )}
-          {field.required&&<span style={{fontSize:11,color:C.red,fontWeight:700,flexShrink:0}}>Required</span>}
+          {field.required&&!isInfo&&<span style={{fontSize:11,color:C.red,fontWeight:700,flexShrink:0}}>Required</span>}
           <span style={{color:C.textMut,fontSize:11}}>{open?"▲":"▼"}</span>
         </div>
         {/* Body */}
         {open&&(
           <div style={{padding:14}}>
+            {/* Kind toggle */}
+            <div style={{display:"flex",gap:6,marginBottom:12,padding:4,background:C.slateLight,borderRadius:9,width:"fit-content"}}>
+              <button onClick={()=>isInfo&&toggleKind()} style={{padding:"5px 12px",borderRadius:7,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:600,background:!isInfo?"#fff":"transparent",color:!isInfo?C.indigo:C.textMut,boxShadow:!isInfo?C.shadow:"none"}}>✓ Check</button>
+              <button onClick={()=>!isInfo&&toggleKind()} style={{padding:"5px 12px",borderRadius:7,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:600,background:isInfo?"#fff":"transparent",color:isInfo?"#1d4ed8":C.textMut,boxShadow:isInfo?C.shadow:"none"}}>ℹ️ Info text</button>
+            </div>
+
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
-              <div style={{gridColumn:"1 / -1"}}><label style={lbl}>Check label</label><Input value={field.label} placeholder="e.g. Check oil level in gearbox" onChange={e=>onChange({...field,label:e.target.value})}/></div>
+              <div style={{gridColumn:"1 / -1"}}>
+                <label style={lbl}>{isInfo?"Heading":"Check label"}</label>
+                <Input value={field.label} placeholder={isInfo?"e.g. Before you begin":"e.g. Check oil level in gearbox"} onChange={e=>onChange({...field,label:e.target.value})}/>
+              </div>
               <div>
                 <label style={lbl}>Reference document</label>
                 <div style={{display:"flex",gap:6,alignItems:"center"}}>
@@ -182,23 +206,34 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
                   )}
                 </div>
               </div>
-              <div><label style={lbl}>Help text</label><Input value={field.helpText} placeholder="Shown as a hint to the operator" onChange={e=>onChange({...field,helpText:e.target.value})}/></div>
+              {!isInfo&&<div><label style={lbl}>Help text</label><Input value={field.helpText} placeholder="Shown as a hint to the operator" onChange={e=>onChange({...field,helpText:e.target.value})}/></div>}
             </div>
-            <div style={{marginBottom:10}}>
-              <label style={lbl}>Response types <span style={{fontWeight:400,color:C.textMut,textTransform:"none"}}>(mix & match)</span></label>
-              <RespTypeChips selected={field.responseTypes} onChange={v=>onChange({...field,responseTypes:v})}/>
-            </div>
-            {(hasN||hasR||hasPF)&&(
-              <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10,padding:"10px 12px",background:C.slateLight,borderRadius:8}}>
-                {hasN&&<><div style={{minWidth:70}}><label style={lbl}>Unit</label><Input value={field.unit} placeholder="°C" onChange={e=>onChange({...field,unit:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Min</label><Input value={field.min} placeholder="0" type="number" onChange={e=>onChange({...field,min:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Max</label><Input value={field.max} placeholder="100" type="number" onChange={e=>onChange({...field,max:e.target.value})}/></div></>}
-                {hasR&&<div><label style={lbl}>Rating max</label><div style={{display:"flex",gap:4}}>{[3,4,5,10].map(n=><button key={n} onClick={()=>onChange({...field,ratingMax:n})} style={{width:32,height:32,borderRadius:8,border:`1.5px solid ${field.ratingMax===n?C.indigo:C.border}`,background:field.ratingMax===n?C.indigoLight:"#fff",color:field.ratingMax===n?C.indigo:C.textSec,cursor:"pointer",fontWeight:700,fontSize:12}}>{n}</button>)}</div></div>}
-                {hasPF&&<div style={{alignSelf:"flex-end",paddingBottom:2}}><label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}><input type="checkbox" checked={field.naAllowed} onChange={e=>onChange({...field,naAllowed:e.target.checked})}/><span style={{fontSize:12,color:C.textSec}}>Allow N/A</span></label></div>}
+
+            {isInfo&&(
+              <div style={{marginBottom:10}}>
+                <label style={lbl}>Info text</label>
+                <Textarea value={field.helpText} placeholder="Setup steps, safety notes, or other information the operator should read — no response needed." onChange={e=>onChange({...field,helpText:e.target.value})} style={{minHeight:90}}/>
               </div>
             )}
+
+            {!isInfo&&(<>
+              <div style={{marginBottom:10}}>
+                <label style={lbl}>Response types <span style={{fontWeight:400,color:C.textMut,textTransform:"none"}}>(mix & match)</span></label>
+                <RespTypeChips selected={field.responseTypes} onChange={v=>onChange({...field,responseTypes:v})}/>
+              </div>
+              {(hasN||hasR||hasPF)&&(
+                <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10,padding:"10px 12px",background:C.slateLight,borderRadius:8}}>
+                  {hasN&&<><div style={{minWidth:70}}><label style={lbl}>Unit</label><Input value={field.unit} placeholder="°C" onChange={e=>onChange({...field,unit:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Min</label><Input value={field.min} placeholder="0" type="number" onChange={e=>onChange({...field,min:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Max</label><Input value={field.max} placeholder="100" type="number" onChange={e=>onChange({...field,max:e.target.value})}/></div></>}
+                  {hasR&&<div><label style={lbl}>Rating max</label><div style={{display:"flex",gap:4}}>{[3,4,5,10].map(n=><button key={n} onClick={()=>onChange({...field,ratingMax:n})} style={{width:32,height:32,borderRadius:8,border:`1.5px solid ${field.ratingMax===n?C.indigo:C.border}`,background:field.ratingMax===n?C.indigoLight:"#fff",color:field.ratingMax===n?C.indigo:C.textSec,cursor:"pointer",fontWeight:700,fontSize:12}}>{n}</button>)}</div></div>}
+                  {hasPF&&<div style={{alignSelf:"flex-end",paddingBottom:2}}><label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}><input type="checkbox" checked={field.naAllowed} onChange={e=>onChange({...field,naAllowed:e.target.checked})}/><span style={{fontSize:12,color:C.textSec}}>Allow N/A</span></label></div>}
+                </div>
+              )}
+            </>)}
+
             <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between"}}>
               <RefPhotoPicker value={field.refPhoto} onChange={v=>onChange({...field,refPhoto:v})} onLightbox={onLightbox}/>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,color:C.textSec}}><input type="checkbox" checked={field.required} onChange={e=>onChange({...field,required:e.target.checked})}/>Required</label>
+                {!isInfo&&<label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,color:C.textSec}}><input type="checkbox" checked={field.required} onChange={e=>onChange({...field,required:e.target.checked})}/>Required</label>}
                 <Btn variant="danger" size="sm" onClick={onDelete}>Remove</Btn>
               </div>
             </div>
@@ -214,6 +249,7 @@ function SectionEditor({section,onChange,onLightbox}){
   const setFields=fields=>onChange({...section,fields});
   const {onDragStart,onDragEnter,onDragEnd}=useDrag(section.fields,setFields);
   const addField=()=>onChange({...section,fields:[...section.fields,newField()]});
+  const addInfoField=()=>onChange({...section,fields:[...section.fields,newInfoField()]});
   const upd=(i,f)=>{const fs=[...section.fields];fs[i]=f;onChange({...section,fields:fs});};
   const del=i=>onChange({...section,fields:section.fields.filter((_,j)=>j!==i)});
   return (
@@ -222,11 +258,18 @@ function SectionEditor({section,onChange,onLightbox}){
         <FieldCard key={f.id} field={f} onChange={u=>upd(i,u)} onDelete={()=>del(i)} onLightbox={onLightbox}
           dragHandlers={{onDragStart:()=>onDragStart(i),onDragEnter:()=>onDragEnter(i),onDragEnd}}/>
       ))}
-      <button onClick={addField} style={{width:"100%",padding:"10px",borderRadius:10,border:`2px dashed ${C.border}`,background:"transparent",color:C.textMut,cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:500,transition:"all 0.15s"}}
-        onMouseEnter={e=>{e.currentTarget.style.borderColor=C.indigo;e.currentTarget.style.color=C.indigo;e.currentTarget.style.background=C.indigoLight;}}
-        onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border;e.currentTarget.style.color=C.textMut;e.currentTarget.style.background="transparent";}}>
-        + Add check
-      </button>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={addField} style={{flex:1,padding:"10px",borderRadius:10,border:`2px dashed ${C.border}`,background:"transparent",color:C.textMut,cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:500,transition:"all 0.15s"}}
+          onMouseEnter={e=>{e.currentTarget.style.borderColor=C.indigo;e.currentTarget.style.color=C.indigo;e.currentTarget.style.background=C.indigoLight;}}
+          onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border;e.currentTarget.style.color=C.textMut;e.currentTarget.style.background="transparent";}}>
+          + Add check
+        </button>
+        <button onClick={addInfoField} style={{flex:1,padding:"10px",borderRadius:10,border:"2px dashed #93c5fd",background:"transparent",color:"#60a5fa",cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:500,transition:"all 0.15s"}}
+          onMouseEnter={e=>{e.currentTarget.style.background="#eff6ff";e.currentTarget.style.color="#1d4ed8";}}
+          onMouseLeave={e=>{e.currentTarget.style.background="transparent";e.currentTarget.style.color="#60a5fa";}}>
+          + Add info text
+        </button>
+      </div>
     </div>
   );
 }
@@ -327,7 +370,7 @@ function DevicePreview({form,onClose}){
   const scale=Math.min(maxW/dev.w, maxH/dev.h, 1);
 
   const sec=form.sections[activeSec]||form.sections[0];
-  const totalFields=form.sections.reduce((a,s)=>a+s.fields.length,0);
+  const totalFields=form.sections.reduce((a,s)=>a+s.fields.filter(f=>f.kind!=="info").length,0);
   const answered=Object.values(values).filter(v=>v!==""&&v!==undefined&&v!==false).length;
 
   const setVal=(fid,rt,v)=>setValues(p=>({...p,[`${fid}_${rt}`]:v}));
@@ -580,6 +623,48 @@ function MarkupCanvas({bgImage, value, onChange, width=320, height=220}){
   );
 }
 
+// ─── Collapsible comment — text plus an optional attached photo ─────────────
+function CommentBlock({field,getVal,setVal}){
+  const existingText=getVal(field.id,"text")||"";
+  const existingPhoto=getVal(field.id,"commentPhoto");
+  const [open,setOpen]=useState(!!existingText||!!existingPhoto);
+  const fileRef=useRef();
+
+  const handlePhoto=e=>{
+    const file=e.target.files[0]; if(!file) return;
+    const r=new FileReader();
+    r.onload=()=>setVal(field.id,"commentPhoto",r.result);
+    r.readAsDataURL(file);
+  };
+
+  if(!open){
+    return (
+      <button onClick={()=>setOpen(true)} style={{alignSelf:"flex-start",padding:"5px 12px",borderRadius:20,border:`1px dashed ${C.border}`,background:"#fff",color:C.textMut,cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:5}}>
+        + Comment
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      <textarea autoFocus placeholder="Add a comment…" value={existingText} onChange={e=>setVal(field.id,"text",e.target.value)} style={{...inp,minHeight:50,resize:"vertical",fontSize:12}}/>
+      <div style={{marginTop:6}}>
+        {existingPhoto?(
+          <div style={{position:"relative",display:"inline-block"}}>
+            <img src={existingPhoto} alt="comment attachment" style={{width:100,height:70,objectFit:"cover",borderRadius:6,border:`1px solid ${C.border}`,display:"block"}}/>
+            <button onClick={()=>setVal(field.id,"commentPhoto",null)} style={{position:"absolute",top:3,right:3,width:18,height:18,borderRadius:"50%",background:C.red,color:"#fff",border:"none",cursor:"pointer",fontSize:10,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+          </div>
+        ):(
+          <>
+            <button onClick={()=>fileRef.current.click()} style={{padding:"5px 10px",borderRadius:6,border:`1px dashed ${C.border}`,background:C.slateLight,color:C.textSec,cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:5}}>📷 Add photo</button>
+            <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={handlePhoto}/>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handlePhoto,fileRefs,activeSec,totalSections,setActiveSec,form}){
   const [lb,setLb]=useState(null);
   const [photoMarkup,setPhotoMarkup]=useState({});
@@ -588,6 +673,31 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
     <>
       {lb&&<Lightbox src={lb} onClose={()=>setLb(null)}/>}
       {sec.fields.map(field=>{
+        // ── Info / instructional text blocks — no response, just content ──
+        if(field.kind==="info"){
+          return (
+            <div key={field.id} style={{marginBottom:10}}>
+              <Card style={{padding:isDesktop?14:11,background:"#eff6ff",borderColor:"#bfdbfe"}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:8}}>
+                  <span style={{fontSize:16,flexShrink:0,lineHeight:1.3}}>ℹ️</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    {field.label&&<div style={{fontSize:isDesktop?13:12,fontWeight:700,color:"#1e3a8a",marginBottom:4}}>{field.label}</div>}
+                    {field.refDoc&&(
+                      <div style={{display:"inline-flex",alignItems:"center",gap:4,fontSize:10,fontFamily:"monospace",background:"#fff",color:"#1d4ed8",padding:"2px 7px",borderRadius:5,border:"1px solid #93c5fd",marginBottom:6}}>
+                        {field.refDoc.startsWith("http")
+                          ?<a href={field.refDoc} target="_blank" rel="noopener noreferrer" style={{color:"#1d4ed8",textDecoration:"none"}}>📄 {field.refDoc} ↗</a>
+                          :<span>📄 {field.refDoc}</span>}
+                      </div>
+                    )}
+                    {field.helpText&&<div style={{fontSize:12,color:"#1e40af",lineHeight:1.5,whiteSpace:"pre-wrap"}}>{field.helpText}</div>}
+                    {field.refPhoto&&<img src={field.refPhoto} alt="reference" onClick={()=>setLb(field.refPhoto)} style={{width:"100%",maxHeight:isDesktop?140:100,objectFit:"cover",borderRadius:8,marginTop:8,border:"1px solid #bfdbfe",cursor:"zoom-in"}} title="Click to enlarge"/>}
+                  </div>
+                </div>
+              </Card>
+            </div>
+          );
+        }
+
         const rt=field.responseTypes;
         return (
           <div key={field.id} style={{marginBottom:10}}>
@@ -631,7 +741,7 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                     {field.unit&&<span style={{fontSize:12,color:C.textSec,fontWeight:500,flexShrink:0}}>{field.unit}</span>}
                   </div>
                 )}
-                {rt.includes("text")&&<textarea placeholder="Add a comment…" value={getVal(field.id,"text")||""} onChange={e=>setVal(field.id,"text",e.target.value)} style={{...inp,minHeight:50,resize:"vertical",fontSize:12}}/>}
+                {rt.includes("text")&&<CommentBlock field={field} getVal={getVal} setVal={setVal}/>}
                 {rt.includes("rating")&&(
                   <div style={{display:"flex",gap:4}}>
                     {Array.from({length:field.ratingMax||5},(_,i)=>i+1).map(n=>(
@@ -721,9 +831,10 @@ Return ONLY a raw JSON object. Start with { end with }. No markdown, no commenta
       "title": "section heading",
       "fields": [
         {
-          "label": "check item text",
-          "refDoc": "any per-check document reference or procedure code shown next to this item, else empty string",
-          "helpText": "any instruction note next to this item",
+          "kind": "check",
+          "label": "check item text, or heading for info blocks",
+          "refDoc": "any per-item document reference or procedure code shown next to this item, else empty string",
+          "helpText": "instruction note next to a check, OR the full body text for an info block",
           "required": false,
           "responseTypes": ["checkbox"],
           "unit": null, "min": null, "max": null, "ratingMax": 5, "naAllowed": true
@@ -733,14 +844,23 @@ Return ONLY a raw JSON object. Start with { end with }. No markdown, no commenta
   ]
 }
 
-responseTypes: pick one or more from: checkbox, passfail, number, text, photo, rating
+IMPORTANT — set "kind" on every field to either "check" or "info":
+- "info" = setup instructions, safety notices, general information, "before you begin" text,
+  scope/purpose statements, or anything else that does NOT require the operator to record a
+  response. These are common at the top of sections or documents. For "info" fields, put the
+  full body text in "helpText", leave "responseTypes" as an empty array [], and ignore
+  required/unit/min/max/ratingMax/naAllowed.
+- "check" = anything requiring an actual response, tick, reading, or answer from the operator.
+  For these, set responseTypes as below.
+
+responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, text, photo, rating
 - checkbox = tick/done/complete
 - passfail = pass/fail/ok/not-ok
 - number = reading, measurement, temperature, pressure, level, count
 - text = comment, note, observation
 - photo = photograph or visual evidence required
 - rating = score or scale
-For items needing result + comment use ["passfail","text"]. Extract ALL checks, preserve ALL sections.`;
+For checks needing result + comment use ["passfail","text"]. Extract EVERY item, preserve ALL sections, and don't force informational content into a check just because it's easier — mark it "info" instead.`;
 
 // Shared JSON extraction + repair — handles markdown fences, stray preamble,
 // and truncated output regardless of where the JSON text came from.
@@ -761,7 +881,7 @@ function extractAndRepairJson(str){
 
 function hydrateImportedForm(parsed){
   return {...parsed,id:uid(),status:"draft",approvals:[],tags:[],version:parsed.version||"1.0",createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),
-    sections:(parsed.sections||[]).map(s=>({...s,id:uid(),fields:(s.fields||[]).map(f=>({...newField(),...f,id:uid(),responseTypes:Array.isArray(f.responseTypes)&&f.responseTypes.length?f.responseTypes:["checkbox"]}))}))};
+    sections:(parsed.sections||[]).map(s=>({...s,id:uid(),fields:(s.fields||[]).map(f=>({...newField(),...f,id:uid(),kind:f.kind==="info"?"info":"check",responseTypes:f.kind==="info"?[]:(Array.isArray(f.responseTypes)&&f.responseTypes.length?f.responseTypes:["checkbox"])}))}))};
 }
 
 function PdfImportModal({onImport,onClose}){
@@ -1043,7 +1163,7 @@ function FormEditorPage({form,onUpdate,onBack,onPreview,onExport,onSave,saving,d
   const [lightbox,setLightbox]=useState(null);
 
   const sec=form.sections.find(s=>s.id===activeSec)||form.sections[0];
-  const totalFields=form.sections.reduce((a,s)=>a+s.fields.length,0);
+  const totalFields=form.sections.reduce((a,s)=>a+s.fields.filter(f=>f.kind!=="info").length,0);
 
   const updateSec=useCallback(updated=>onUpdate({...form,sections:form.sections.map(s=>s.id===updated.id?updated:s),updatedAt:new Date().toISOString()}),[form,onUpdate]);
 

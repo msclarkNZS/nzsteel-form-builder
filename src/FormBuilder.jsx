@@ -23,6 +23,7 @@ const RESP_TYPES = [
   { type:"checkbox", label:"Checkbox",   icon:"✓", color:C.green,  bg:C.greenLight  },
   { type:"passfail", label:"Pass/Fail",  icon:"◉", color:C.blue,   bg:C.blueLight   },
   { type:"number",   label:"Number",     icon:"#", color:C.amber,  bg:C.amberLight  },
+  { type:"textfield",label:"Text",       icon:"Aa",color:"#c2410c",bg:"#ffedd5"      },
   { type:"text",     label:"Comment",    icon:"✏", color:C.slate,  bg:C.slateLight  },
   { type:"photo",    label:"Photo",      icon:"📷",color:C.purple, bg:C.purpleLight },
   { type:"rating",   label:"Rating",     icon:"★", color:C.indigo, bg:C.indigoLight },
@@ -624,10 +625,12 @@ function MarkupCanvas({bgImage, value, onChange, width=320, height=220}){
 }
 
 // ─── Collapsible comment — text plus an optional attached photo ─────────────
+// Forces itself open (no collapse button) when the field is marked Required.
 function CommentBlock({field,getVal,setVal}){
   const existingText=getVal(field.id,"text")||"";
   const existingPhoto=getVal(field.id,"commentPhoto");
-  const [open,setOpen]=useState(!!existingText||!!existingPhoto);
+  const forced=!!field.required;
+  const [open,setOpen]=useState(!!existingText||!!existingPhoto||forced);
   const fileRef=useRef();
 
   const handlePhoto=e=>{
@@ -647,7 +650,8 @@ function CommentBlock({field,getVal,setVal}){
 
   return (
     <div>
-      <textarea autoFocus placeholder="Add a comment…" value={existingText} onChange={e=>setVal(field.id,"text",e.target.value)} style={{...inp,minHeight:50,resize:"vertical",fontSize:12}}/>
+      {forced&&<div style={{fontSize:10,fontWeight:700,color:C.red,marginBottom:4,textTransform:"uppercase",letterSpacing:"0.04em"}}>Comment required</div>}
+      <textarea autoFocus={!forced} placeholder="Add a comment…" value={existingText} onChange={e=>setVal(field.id,"text",e.target.value)} style={{...inp,minHeight:50,resize:"vertical",fontSize:12,borderColor:forced&&!existingText?"#fca5a5":C.border}}/>
       <div style={{marginTop:6}}>
         {existingPhoto?(
           <div style={{position:"relative",display:"inline-block"}}>
@@ -739,6 +743,11 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                   <div style={{display:"flex",gap:6,alignItems:"center"}}>
                     <input type="number" placeholder={field.min||"0"} value={getVal(field.id,"number")||""} onChange={e=>setVal(field.id,"number",e.target.value)} style={{...inp,flex:1,fontSize:14,fontWeight:600,textAlign:"center"}}/>
                     {field.unit&&<span style={{fontSize:12,color:C.textSec,fontWeight:500,flexShrink:0}}>{field.unit}</span>}
+                  </div>
+                )}
+                {rt.includes("textfield")&&(
+                  <div>
+                    <textarea placeholder={field.required?"Required — enter response…":"Enter response…"} value={getVal(field.id,"textfield")||""} onChange={e=>setVal(field.id,"textfield",e.target.value)} style={{...inp,minHeight:56,resize:"vertical",fontSize:12,borderColor:field.required&&!getVal(field.id,"textfield")?"#fca5a5":C.border}}/>
                   </div>
                 )}
                 {rt.includes("text")&&<CommentBlock field={field} getVal={getVal} setVal={setVal}/>}
@@ -853,14 +862,15 @@ IMPORTANT — set "kind" on every field to either "check" or "info":
 - "check" = anything requiring an actual response, tick, reading, or answer from the operator.
   For these, set responseTypes as below.
 
-responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, text, photo, rating
+responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, textfield, text, photo, rating
 - checkbox = tick/done/complete
 - passfail = pass/fail/ok/not-ok
 - number = reading, measurement, temperature, pressure, level, count
-- text = comment, note, observation
+- textfield = the check's actual response IS free text (e.g. "describe the fault", "operator name", "enter reading description") — always shown as an open text box
+- text = an optional supplementary comment/note alongside another response type, not the primary answer — shown collapsed behind a "+ Comment" button unless marked required
 - photo = photograph or visual evidence required
 - rating = score or scale
-For checks needing result + comment use ["passfail","text"]. Extract EVERY item, preserve ALL sections, and don't force informational content into a check just because it's easier — mark it "info" instead.`;
+For checks needing result + optional comment use ["passfail","text"]. For checks where free text IS the answer, use ["textfield"] (or combine with others as needed). Extract EVERY item, preserve ALL sections, and don't force informational content into a check just because it's easier — mark it "info" instead.`;
 
 // Shared JSON extraction + repair — handles markdown fences, stray preamble,
 // and truncated output regardless of where the JSON text came from.

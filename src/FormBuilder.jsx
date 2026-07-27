@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { supabase } from "./supabaseClient";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 // ─── Palette ────────────────────────────────────────────────────────────────
 const C = {
@@ -25,10 +26,12 @@ const RESP_TYPES = [
   { type:"number",   label:"Number",     icon:"#", color:C.amber,  bg:C.amberLight  },
   { type:"datetime", label:"Date/Time",  icon:"📅",color:"#7c3aed",bg:"#ede9fe"      },
   { type:"textfield",label:"Text",       icon:"Aa",color:"#c2410c",bg:"#ffedd5"      },
+  { type:"dropdown", label:"Dropdown",   icon:"▾", color:"#0369a1",bg:"#e0f2fe"      },
   { type:"text",     label:"Comment",    icon:"✏", color:C.slate,  bg:C.slateLight  },
   { type:"photo",    label:"Photo",      icon:"📷",color:C.purple, bg:C.purpleLight },
   { type:"rating",   label:"Rating",     icon:"★", color:C.indigo, bg:C.indigoLight },
   { type:"markup",   label:"Mark-up",    icon:"✏️", color:"#0891b2", bg:"#cffafe"      },
+  { type:"matrix",   label:"Per-item grid", icon:"▦", color:"#be185d",bg:"#fce7f3"   },
 ];
 
 // ─── Status workflow ─────────────────────────────────────────────────────────
@@ -60,10 +63,110 @@ function formatNZTime(t){ // t: "HH:MM" (already 24-hour from the native input)
   return t;
 }
 
+// ─── PDF photo extraction ─────────────────────────────────────────────────
+// Runs entirely in the browser via pdf.js — no API calls, no billing.
+// Pulls out (a) the actual embedded raster images inside the PDF, and
+// (b) a full-page render of every page as a reliable fallback, since not
+// every embedded image decodes cleanly depending on how the PDF was made.
+const MIN_EMBEDDED_IMAGE_SIZE = 80; // px — filters out tiny logos/icons/bullets
+
+function pdfImageToDataURL(img){
+  const {width,height}=img;
+  if(!width||!height) return null;
+  const canvas=document.createElement("canvas");
+  canvas.width=width; canvas.height=height;
+  const ctx=canvas.getContext("2d");
+
+  // Modern pdf.js returns a ready-to-draw ImageBitmap when the browser
+  // supports it — simplest and most reliable path.
+  if(img.bitmap){
+    ctx.drawImage(img.bitmap,0,0,width,height);
+    return canvas.toDataURL("image/png");
+  }
+
+  // Fallback: raw pixel data with an explicit pixel-format "kind"
+  // (older pdf.js, or environments without ImageBitmap support).
+  const {data,kind}=img;
+  if(!data) return null;
+  const imageData=ctx.createImageData(width,height);
+  if(kind===3){ // RGBA already
+    imageData.data.set(data);
+  } else if(kind===2){ // RGB -> RGBA
+    for(let i=0,j=0;i<data.length;i+=3,j+=4){
+      imageData.data[j]=data[i]; imageData.data[j+1]=data[i+1]; imageData.data[j+2]=data[i+2]; imageData.data[j+3]=255;
+    }
+  } else if(kind===1){ // 1bpp packed grayscale
+    const bytesPerRow=Math.ceil(width/8);
+    for(let y=0;y<height;y++){
+      for(let x=0;x<width;x++){
+        const byteIndex=y*bytesPerRow+(x>>3);
+        const bit=7-(x%8);
+        const on=(data[byteIndex]>>bit)&1;
+        const gray=on?255:0;
+        const j=(y*width+x)*4;
+        imageData.data[j]=gray; imageData.data[j+1]=gray; imageData.data[j+2]=gray; imageData.data[j+3]=255;
+      }
+    }
+  } else {
+    return null; // unrecognised pixel format — skip rather than risk a garbled image
+  }
+  ctx.putImageData(imageData,0,0);
+  return canvas.toDataURL("image/png");
+}
+
+async function extractPdfImages(file, onProgress){
+  const pdfjsLib = await import("pdfjs-dist");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
+  const results = [];
+  const maxPages = Math.min(doc.numPages, 40); // sanity cap for very large PDFs
+
+  for(let i=1;i<=maxPages;i++){
+    onProgress?.(`Processing page ${i} of ${maxPages}…`);
+    const page = await doc.getPage(i);
+
+    // Full-page render — always works, reliable fallback
+    try{
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      results.push({ id:`page-${i}`, label:`Page ${i} (full page)`, dataUrl: canvas.toDataURL("image/png"), source:"page", page:i });
+    }catch(_){ /* skip a page that fails to render rather than aborting everything */ }
+
+    // Embedded raster images — the actual photos/diagrams within the page
+    try{
+      const opList = await page.getOperatorList();
+      const OPS = pdfjsLib.OPS;
+      let imgIdx=0;
+      for(let j=0;j<opList.fnArray.length;j++){
+        const fn=opList.fnArray[j];
+        if(fn===OPS.paintImageXObject||fn===OPS.paintJpegXObject){
+          const imgName=opList.argsArray[j][0];
+          imgIdx++;
+          try{
+            const img = await new Promise((resolve)=>page.objs.get(imgName,resolve));
+            if(img && img.width>=MIN_EMBEDDED_IMAGE_SIZE && img.height>=MIN_EMBEDDED_IMAGE_SIZE){
+              const dataUrl = pdfImageToDataURL(img);
+              if(dataUrl) results.push({ id:`img-${i}-${imgIdx}`, label:`Photo ${imgIdx} (page ${i})`, dataUrl, source:"embedded", page:i });
+            }
+          }catch(_){ /* skip images that fail to decode */ }
+        }
+      }
+    }catch(_){ /* operator list traversal failed for this page — page render above still stands */ }
+  }
+  return results;
+}
+
 const newField = () => ({
   id:uid(), kind:"check", label:"", helpText:"", refDoc:"", refPhoto:null,
   required:false, responseTypes:["checkbox"],
   unit:"", min:"", max:"", ratingMax:5, naAllowed:true, dtMode:"date",
+  dropdownOptions:[], dropdownMulti:false,
+  matrixColumns:[], matrixCellType:"checkbox",
 });
 
 const newInfoField = () => ({
@@ -95,6 +198,7 @@ function useDrag(items, setItems) {
 // ─── UI primitives ────────────────────────────────────────────────────────────
 const inp = { width:"100%", background:"#fff", border:`1px solid ${C.border}`, borderRadius:8, color:C.text, padding:"8px 12px", fontSize:13, outline:"none", boxSizing:"border-box", fontFamily:"inherit", transition:"border-color 0.15s,box-shadow 0.15s" };
 const lbl = { fontSize:11, fontWeight:600, color:C.textSec, marginBottom:4, display:"block", textTransform:"uppercase", letterSpacing:"0.05em" };
+const btnGhostSm = { padding:"4px 9px", borderRadius:6, border:`1px solid ${C.border}`, background:"#fff", color:C.textSec, cursor:"pointer", fontSize:10.5, fontWeight:600, fontFamily:"inherit" };
 
 function Input({style,...p}){
   return <input style={{...inp,...style}} {...p}
@@ -130,7 +234,35 @@ function Lightbox({src,onClose}){
   );
 }
 
-// ─── Response type chips ──────────────────────────────────────────────────────
+// ─── Small add/remove tag list — used for dropdown options & matrix columns ──
+function TagListEditor({items,onChange,placeholder,accent,accentBg}){
+  const [draft,setDraft]=useState("");
+  const add=()=>{
+    const v=draft.trim();
+    if(!v) return;
+    onChange([...(items||[]),v]);
+    setDraft("");
+  };
+  const remove=(i)=>onChange(items.filter((_,j)=>j!==i));
+  return (
+    <div>
+      <div style={{display:"flex",gap:6,marginBottom:6}}>
+        <Input value={draft} placeholder={placeholder} onChange={e=>setDraft(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();add();}}}/>
+        <Btn variant="ghost" size="sm" onClick={add}>+ Add</Btn>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+        {(items||[]).map((v,i)=>(
+          <span key={i} style={{display:"inline-flex",alignItems:"center",gap:5,padding:"3px 9px",borderRadius:14,fontSize:11,fontWeight:600,background:accentBg,color:accent}}>
+            {v}
+            <button onClick={()=>remove(i)} style={{background:"none",border:"none",cursor:"pointer",color:accent,fontSize:11,padding:0,lineHeight:1,opacity:0.7}}>✕</button>
+          </span>
+        ))}
+        {(!items||items.length===0)&&<span style={{fontSize:11,color:C.textMut}}>No options added yet</span>}
+      </div>
+    </div>
+  );
+}
+
 function RespTypeChips({selected,onChange}){
   const toggle=t=>{
     if(selected.includes(t)){if(selected.length===1)return;onChange(selected.filter(x=>x!==t));}
@@ -147,7 +279,7 @@ function RespTypeChips({selected,onChange}){
 }
 
 // ─── Ref photo picker ─────────────────────────────────────────────────────────
-function RefPhotoPicker({value,onChange,onLightbox}){
+function RefPhotoPicker({value,onChange,onLightbox,pdfGalleryCount,onOpenPdfGallery}){
   const ref=useRef();
   const pick=e=>{const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=()=>onChange(r.result);r.readAsDataURL(file);};
   return (
@@ -159,8 +291,15 @@ function RefPhotoPicker({value,onChange,onLightbox}){
           <button onClick={()=>onChange(null)} style={{position:"absolute",top:4,right:4,width:20,height:20,borderRadius:"50%",background:C.red,color:"#fff",border:"none",cursor:"pointer",fontSize:11,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
         </div>
       ):(
-        <div onClick={()=>ref.current.click()} style={{width:120,height:80,borderRadius:8,border:`2px dashed ${C.border}`,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",color:C.textMut,fontSize:11,gap:4,background:C.slateLight,transition:"border-color 0.15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor=C.indigo} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
-          <span style={{fontSize:20}}>📷</span><span>Add photo</span>
+        <div style={{display:"flex",gap:8}}>
+          <div onClick={()=>ref.current.click()} style={{width:110,height:80,borderRadius:8,border:`2px dashed ${C.border}`,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",color:C.textMut,fontSize:11,gap:4,background:C.slateLight,transition:"border-color 0.15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor=C.indigo} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+            <span style={{fontSize:20}}>📷</span><span>Add photo</span>
+          </div>
+          {onOpenPdfGallery&&(
+            <div onClick={onOpenPdfGallery} style={{width:110,height:80,borderRadius:8,border:`2px dashed ${C.border}`,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",color:C.textMut,fontSize:11,gap:4,background:C.slateLight,transition:"border-color 0.15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor=C.indigo} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+              <span style={{fontSize:20}}>📄</span><span>From PDF{pdfGalleryCount>0?` (${pdfGalleryCount})`:""}</span>
+            </div>
+          )}
         </div>
       )}
       <input ref={ref} type="file" accept="image/*" style={{display:"none"}} onChange={pick}/>
@@ -168,14 +307,95 @@ function RefPhotoPicker({value,onChange,onLightbox}){
   );
 }
 
+// ─── PDF photo picker modal — extract once, reuse across all checks ────────
+function PdfPhotoPickerModal({gallery,extracting,progress,error,onExtract,onPick,onClose}){
+  const [dragOver,setDragOver]=useState(false);
+  const fileRef=useRef();
+  const embedded=gallery.filter(g=>g.source==="embedded");
+  const pages=gallery.filter(g=>g.source==="page");
+
+  const thumb=(g)=>(
+    <div key={g.id} onClick={()=>onPick(g.dataUrl)} style={{cursor:"pointer",borderRadius:8,overflow:"hidden",border:`1px solid ${C.border}`,transition:"border-color 0.15s",background:"#fff"}}
+      onMouseEnter={e=>e.currentTarget.style.borderColor=C.indigo} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+      <img src={g.dataUrl} alt={g.label} style={{width:"100%",height:100,objectFit:"cover",display:"block"}}/>
+      <div style={{padding:"5px 8px",fontSize:10,color:C.textSec}}>{g.label}</div>
+    </div>
+  );
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.6)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250,padding:24}}>
+      <Card style={{width:680,maxHeight:"88vh",display:"flex",flexDirection:"column",padding:0}}>
+        <div style={{padding:"16px 20px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10}}>
+          <div style={{fontSize:16,fontWeight:700}}>📄 Photos from PDF</div>
+          <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+            {gallery.length>0&&!extracting&&<Btn variant="ghost" size="sm" onClick={()=>fileRef.current.click()}>↻ Extract different PDF</Btn>}
+            <Btn variant="ghost" size="sm" onClick={onClose}>Close</Btn>
+          </div>
+        </div>
+
+        <div style={{flex:1,overflowY:"auto",padding:20}}>
+          {gallery.length===0&&!extracting&&(
+            <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)}
+              onDrop={e=>{e.preventDefault();setDragOver(false);onExtract(e.dataTransfer.files[0]);}}
+              onClick={()=>fileRef.current.click()}
+              style={{border:`2px dashed ${dragOver?C.indigo:C.border}`,borderRadius:12,padding:"48px 24px",textAlign:"center",cursor:"pointer",background:dragOver?C.indigoLight:C.bg}}>
+              <div style={{fontSize:40,marginBottom:10}}>📄</div>
+              <div style={{fontSize:14,fontWeight:600,marginBottom:4}}>Drop a PDF here or click to browse</div>
+              <div style={{fontSize:12,color:C.textMut}}>Pulls out embedded photos and full page images — all processed in your browser, nothing uploaded anywhere</div>
+            </div>
+          )}
+
+          {extracting&&(
+            <div style={{textAlign:"center",padding:"48px 24px",color:C.textSec}}>
+              <div style={{fontSize:32,marginBottom:12}}>⏳</div>
+              <div style={{fontSize:13}}>{progress||"Processing…"}</div>
+            </div>
+          )}
+
+          {error&&!extracting&&(
+            <div style={{padding:"14px 16px",borderRadius:10,border:`1px solid ${C.red}`,background:C.redLight,color:C.red,fontSize:13,marginBottom:16}}>{error}</div>
+          )}
+
+          {!extracting&&embedded.length>0&&(
+            <div style={{marginBottom:24}}>
+              <div style={{fontSize:11,fontWeight:700,color:C.textMut,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>Photos found in the PDF ({embedded.length})</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:10}}>
+                {embedded.map(thumb)}
+              </div>
+            </div>
+          )}
+
+          {!extracting&&pages.length>0&&(
+            <div>
+              <div style={{fontSize:11,fontWeight:700,color:C.textMut,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>Full pages ({pages.length}) <span style={{fontWeight:400,textTransform:"none"}}>— use these if the photo above didn't extract cleanly</span></div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:10}}>
+                {pages.map(thumb)}
+              </div>
+            </div>
+          )}
+
+          {!extracting&&gallery.length>0&&embedded.length===0&&(
+            <div style={{fontSize:12,color:C.textMut,marginBottom:16}}>No embedded photos were detected in this PDF — only full-page images are available below.</div>
+          )}
+        </div>
+
+        <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={e=>e.target.files[0]&&onExtract(e.target.files[0])}/>
+      </Card>
+    </div>
+  );
+}
+
 // ─── Field card ───────────────────────────────────────────────────────────────
-function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
+function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox,pdfGalleryCount,onOpenPdfGallery}){
   const [open,setOpen]=useState(true);
+  const [refDocOpen,setRefDocOpen]=useState(!!field.refDoc);
   const isInfo=field.kind==="info";
   const hasN=field.responseTypes.includes("number");
   const hasR=field.responseTypes.includes("rating");
   const hasPF=field.responseTypes.includes("passfail");
   const hasDT=field.responseTypes.includes("datetime");
+  const hasDD=field.responseTypes.includes("dropdown");
+  const hasMatrix=field.responseTypes.includes("matrix");
 
   const toggleKind=()=>{
     if(isInfo) onChange({...field,kind:"check",responseTypes:field.responseTypes.length?field.responseTypes:["checkbox"]});
@@ -217,13 +437,24 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
                 <Input value={field.label} placeholder={isInfo?"e.g. Before you begin":"e.g. Check oil level in gearbox"} onChange={e=>onChange({...field,label:e.target.value})}/>
               </div>
               <div>
-                <label style={lbl}>Reference document</label>
-                <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                  <Input value={field.refDoc} placeholder="IP-0412.135 or URL" style={{fontFamily:"monospace",fontSize:12}} onChange={e=>onChange({...field,refDoc:e.target.value})}/>
-                  {field.refDoc&&field.refDoc.startsWith("http")&&(
-                    <a href={field.refDoc} target="_blank" rel="noopener noreferrer" style={{flexShrink:0,fontSize:18,textDecoration:"none"}} title="Open document">🔗</a>
-                  )}
-                </div>
+                {refDocOpen?(
+                  <>
+                    <label style={lbl}>Reference document</label>
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      <Input value={field.refDoc} placeholder="IP-0412.135 or URL" style={{fontFamily:"monospace",fontSize:12}} onChange={e=>onChange({...field,refDoc:e.target.value})} autoFocus={!field.refDoc}/>
+                      {field.refDoc&&field.refDoc.startsWith("http")&&(
+                        <a href={field.refDoc} target="_blank" rel="noopener noreferrer" style={{flexShrink:0,fontSize:18,textDecoration:"none"}} title="Open document">🔗</a>
+                      )}
+                      <button onClick={()=>{onChange({...field,refDoc:""});setRefDocOpen(false);}} title="Remove" style={{flexShrink:0,width:22,height:22,borderRadius:"50%",border:"none",background:C.slateLight,color:C.textMut,cursor:"pointer",fontSize:11,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                    </div>
+                  </>
+                ):(
+                  <div style={{display:"flex",alignItems:"flex-end",height:"100%",paddingBottom:1}}>
+                    <button onClick={()=>setRefDocOpen(true)} style={{padding:"7px 12px",borderRadius:20,border:`1px dashed ${C.border}`,background:"#fff",color:C.textMut,cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:5}}>
+                      📄 + Add reference document
+                    </button>
+                  </div>
+                )}
               </div>
               {!isInfo&&<div><label style={lbl}>Help text</label><Input value={field.helpText} placeholder="Shown as a hint to the operator" onChange={e=>onChange({...field,helpText:e.target.value})}/></div>}
             </div>
@@ -240,18 +471,57 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
                 <label style={lbl}>Response types <span style={{fontWeight:400,color:C.textMut,textTransform:"none"}}>(mix & match)</span></label>
                 <RespTypeChips selected={field.responseTypes} onChange={v=>onChange({...field,responseTypes:v})}/>
               </div>
-              {(hasN||hasR||hasPF||hasDT)&&(
+              {(hasN||hasR||hasPF||hasDT||hasDD)&&(
                 <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10,padding:"10px 12px",background:C.slateLight,borderRadius:8}}>
                   {hasN&&<><div style={{minWidth:70}}><label style={lbl}>Unit</label><Input value={field.unit} placeholder="°C" onChange={e=>onChange({...field,unit:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Min</label><Input value={field.min} placeholder="0" type="number" onChange={e=>onChange({...field,min:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Max</label><Input value={field.max} placeholder="100" type="number" onChange={e=>onChange({...field,max:e.target.value})}/></div></>}
                   {hasR&&<div><label style={lbl}>Rating max</label><div style={{display:"flex",gap:4}}>{[3,4,5,10].map(n=><button key={n} onClick={()=>onChange({...field,ratingMax:n})} style={{width:32,height:32,borderRadius:8,border:`1.5px solid ${field.ratingMax===n?C.indigo:C.border}`,background:field.ratingMax===n?C.indigoLight:"#fff",color:field.ratingMax===n?C.indigo:C.textSec,cursor:"pointer",fontWeight:700,fontSize:12}}>{n}</button>)}</div></div>}
                   {hasPF&&<div style={{alignSelf:"flex-end",paddingBottom:2}}><label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}><input type="checkbox" checked={field.naAllowed} onChange={e=>onChange({...field,naAllowed:e.target.checked})}/><span style={{fontSize:12,color:C.textSec}}>Allow N/A</span></label></div>}
                   {hasDT&&<div><label style={lbl}>Capture</label><div style={{display:"flex",gap:4}}>{[{v:"date",l:"Date"},{v:"time",l:"Time"},{v:"datetime",l:"Date & Time"}].map(o=><button key={o.v} onClick={()=>onChange({...field,dtMode:o.v})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${field.dtMode===o.v?"#7c3aed":C.border}`,background:field.dtMode===o.v?"#ede9fe":"#fff",color:field.dtMode===o.v?"#7c3aed":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>{o.l}</button>)}</div></div>}
+                  {hasDD&&(
+                    <div style={{width:"100%"}}>
+                      <div style={{display:"flex",gap:12,alignItems:"flex-start",flexWrap:"wrap"}}>
+                        <div style={{flex:1,minWidth:220}}>
+                          <label style={lbl}>Dropdown options</label>
+                          <TagListEditor items={field.dropdownOptions} onChange={v=>onChange({...field,dropdownOptions:v})} placeholder="e.g. Good" accent="#0369a1" accentBg="#e0f2fe"/>
+                        </div>
+                        <div>
+                          <label style={lbl}>Selection</label>
+                          <div style={{display:"flex",gap:4}}>
+                            <button onClick={()=>onChange({...field,dropdownMulti:false})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${!field.dropdownMulti?"#0369a1":C.border}`,background:!field.dropdownMulti?"#e0f2fe":"#fff",color:!field.dropdownMulti?"#0369a1":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>Single</button>
+                            <button onClick={()=>onChange({...field,dropdownMulti:true})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${field.dropdownMulti?"#0369a1":C.border}`,background:field.dropdownMulti?"#e0f2fe":"#fff",color:field.dropdownMulti?"#0369a1":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>Multi</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+              {hasMatrix&&(
+                <div style={{marginBottom:10,padding:"10px 12px",background:"#fdf2f8",border:"1px solid #fbcfe8",borderRadius:8}}>
+                  <div style={{fontSize:11,color:"#9d174d",marginBottom:8}}>Renders as one row of identical checks — one per column. Use this for "same check, repeated across several burners/units/kilns" style tables.</div>
+                  <div style={{display:"flex",gap:12,alignItems:"flex-start",flexWrap:"wrap"}}>
+                    <div style={{flex:1,minWidth:220}}>
+                      <label style={lbl}>Columns</label>
+                      <TagListEditor items={field.matrixColumns} onChange={v=>onChange({...field,matrixColumns:v})} placeholder="e.g. #2" accent="#be185d" accentBg="#fce7f3"/>
+                      <div style={{display:"flex",gap:6,marginTop:6}}>
+                        <button onClick={()=>onChange({...field,matrixColumns:["#2","#3","#4","#5","#6","#7","#8","#9","#10"]})} style={{...btnGhostSm}}>Preset: Burners #2–#10</button>
+                        <button onClick={()=>onChange({...field,matrixColumns:[]})} style={{...btnGhostSm}}>Clear</button>
+                      </div>
+                    </div>
+                    <div>
+                      <label style={lbl}>Cell type</label>
+                      <div style={{display:"flex",gap:4}}>
+                        <button onClick={()=>onChange({...field,matrixCellType:"checkbox"})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${field.matrixCellType==="checkbox"?"#be185d":C.border}`,background:field.matrixCellType==="checkbox"?"#fce7f3":"#fff",color:field.matrixCellType==="checkbox"?"#be185d":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>✓ Checkbox</button>
+                        <button onClick={()=>onChange({...field,matrixCellType:"passfail"})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${field.matrixCellType==="passfail"?"#be185d":C.border}`,background:field.matrixCellType==="passfail"?"#fce7f3":"#fff",color:field.matrixCellType==="passfail"?"#be185d":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>◉ Pass/Fail</button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
             </>)}
 
             <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between"}}>
-              <RefPhotoPicker value={field.refPhoto} onChange={v=>onChange({...field,refPhoto:v})} onLightbox={onLightbox}/>
+              <RefPhotoPicker value={field.refPhoto} onChange={v=>onChange({...field,refPhoto:v})} onLightbox={onLightbox} pdfGalleryCount={pdfGalleryCount} onOpenPdfGallery={onOpenPdfGallery?()=>onOpenPdfGallery(v=>onChange({...field,refPhoto:v})):undefined}/>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
                 {!isInfo&&<label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,color:C.textSec}}><input type="checkbox" checked={field.required} onChange={e=>onChange({...field,required:e.target.checked})}/>Required</label>}
                 <Btn variant="danger" size="sm" onClick={onDelete}>Remove</Btn>
@@ -265,7 +535,7 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
 }
 
 // ─── Section editor ───────────────────────────────────────────────────────────
-function SectionEditor({section,onChange,onLightbox}){
+function SectionEditor({section,onChange,onLightbox,pdfGalleryCount,onOpenPdfGallery}){
   const setFields=fields=>onChange({...section,fields});
   const {onDragStart,onDragEnter,onDragEnd}=useDrag(section.fields,setFields);
   const addField=()=>onChange({...section,fields:[...section.fields,newField()]});
@@ -276,6 +546,7 @@ function SectionEditor({section,onChange,onLightbox}){
     <div>
       {section.fields.map((f,i)=>(
         <FieldCard key={f.id} field={f} onChange={u=>upd(i,u)} onDelete={()=>del(i)} onLightbox={onLightbox}
+          pdfGalleryCount={pdfGalleryCount} onOpenPdfGallery={onOpenPdfGallery}
           dragHandlers={{onDragStart:()=>onDragStart(i),onDragEnter:()=>onDragEnter(i),onDragEnd}}/>
       ))}
       <div style={{display:"flex",gap:8}}>
@@ -376,6 +647,81 @@ const DEVICES=[
   {id:"desktop",   label:"Desktop",  icon:"🖥",  w:1280, h:800,  orient:"landscape"},
 ];
 
+// ─── Review summary — failed checks & anything with a comment ──────────────
+function buildFormSummary(form, values){
+  const failures=[];
+  const comments=[];
+  form.sections.forEach(sec=>{
+    sec.fields.forEach(field=>{
+      if(field.kind==="info") return;
+      const rt=field.responseTypes;
+      const label=field.label||"Untitled check";
+
+      if(rt.includes("passfail")){
+        if(values[`${field.id}_passfail`]==="Fail") failures.push({section:sec.title,label,detail:null});
+      }
+      if(rt.includes("matrix")&&field.matrixCellType==="passfail"){
+        (field.matrixColumns||[]).forEach(col=>{
+          if(values[`${field.id}_matrix_${col}`]==="Fail") failures.push({section:sec.title,label,detail:col});
+        });
+      }
+
+      const commentText=values[`${field.id}_text`];
+      const commentPhoto=values[`${field.id}_commentPhoto`];
+      if(commentText||commentPhoto) comments.push({section:sec.title,label,text:commentText,hasPhoto:!!commentPhoto});
+
+      if(rt.includes("textfield")&&values[`${field.id}_textfield`]){
+        comments.push({section:sec.title,label,text:values[`${field.id}_textfield`],hasPhoto:false});
+      }
+    });
+  });
+  return {failures,comments};
+}
+
+function SummaryView({form,values,isDesktop}){
+  const {failures,comments}=buildFormSummary(form,values);
+  const allClear=failures.length===0&&comments.length===0;
+  return (
+    <div style={{padding:isDesktop?"16px 20px":"10px"}}>
+      <div style={{fontSize:isDesktop?16:14,fontWeight:700,color:C.text,marginBottom:4}}>Review before submitting</div>
+      <div style={{fontSize:12,color:C.textSec,marginBottom:16}}>{failures.length} failed check{failures.length!==1?"s":""} · {comments.length} comment{comments.length!==1?"s":""}</div>
+
+      {allClear&&(
+        <div style={{textAlign:"center",padding:"40px 20px",color:C.textMut}}>
+          <div style={{fontSize:32,marginBottom:8}}>✅</div>
+          <div style={{fontSize:13}}>No failed checks or comments — all clear.</div>
+        </div>
+      )}
+
+      {failures.length>0&&(
+        <div style={{marginBottom:20}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.red,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>❌ Failed checks ({failures.length})</div>
+          {failures.map((f,i)=>(
+            <div key={i} style={{padding:"10px 12px",borderRadius:8,border:"1px solid #fca5a5",background:C.redLight,marginBottom:6}}>
+              <div style={{fontSize:11,color:"#991b1b",marginBottom:2}}>{f.section}{f.detail?` · ${f.detail}`:""}</div>
+              <div style={{fontSize:12,fontWeight:600,color:C.text}}>{f.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {comments.length>0&&(
+        <div>
+          <div style={{fontSize:11,fontWeight:700,color:C.textSec,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>💬 Checks with comments ({comments.length})</div>
+          {comments.map((c,i)=>(
+            <div key={i} style={{padding:"10px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"#fff",marginBottom:6}}>
+              <div style={{fontSize:11,color:C.textMut,marginBottom:2}}>{c.section}</div>
+              <div style={{fontSize:12,fontWeight:600,color:C.text,marginBottom:4}}>{c.label}</div>
+              {c.text&&<div style={{fontSize:12,color:C.textSec}}>{c.text}</div>}
+              {c.hasPhoto&&<div style={{fontSize:11,color:C.purple,marginTop:4}}>📷 Photo attached</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DevicePreview({form,onClose}){
   const [devId,setDevId]=useState("phone-p");
   const [values,setValues]=useState({});
@@ -389,7 +735,8 @@ function DevicePreview({form,onClose}){
   const maxH=Math.min(window.innerHeight-180, dev.h);
   const scale=Math.min(maxW/dev.w, maxH/dev.h, 1);
 
-  const sec=form.sections[activeSec]||form.sections[0];
+  const showSummary=activeSec==="summary";
+  const sec=showSummary?null:(form.sections[activeSec]||form.sections[0]);
   const totalFields=form.sections.reduce((a,s)=>a+s.fields.filter(f=>f.kind!=="info").length,0);
   const answered=Object.values(values).filter(v=>v!==""&&v!==undefined&&v!==false).length;
 
@@ -443,39 +790,53 @@ function DevicePreview({form,onClose}){
           {isDesktop?(
             <div style={{flex:1,display:"flex",overflow:"hidden"}}>
               {/* Sidebar nav */}
-              <div style={{width:220,background:"#fff",borderRight:`1px solid ${C.border}`,overflowY:"auto",padding:"12px 10px"}}>
+              <div style={{width:220,background:"#fff",borderRight:`1px solid ${C.border}`,overflowY:"auto",padding:"12px 10px",display:"flex",flexDirection:"column"}}>
                 <div style={{fontSize:10,fontWeight:700,color:C.textMut,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8,padding:"0 6px"}}>Sections</div>
                 {form.sections.map((s,i)=>(
                   <div key={s.id} onClick={()=>setActiveSec(i)} style={{padding:"8px 10px",borderRadius:8,cursor:"pointer",marginBottom:2,background:activeSec===i?C.indigoLight:"transparent",color:activeSec===i?C.indigo:C.textSec,fontWeight:activeSec===i?600:400,fontSize:12,transition:"all 0.15s"}}>
                     {s.title||`Section ${i+1}`} <span style={{float:"right",color:C.textMut,fontWeight:400}}>{s.fields.length}</span>
                   </div>
                 ))}
+                <div style={{borderTop:`1px solid ${C.border}`,marginTop:8,paddingTop:8}}>
+                  <div onClick={()=>setActiveSec("summary")} style={{padding:"8px 10px",borderRadius:8,cursor:"pointer",background:showSummary?C.indigoLight:"transparent",color:showSummary?C.indigo:C.textSec,fontWeight:showSummary?600:500,fontSize:12,transition:"all 0.15s"}}>
+                    📋 Summary
+                  </div>
+                </div>
               </div>
               {/* Fields */}
-              <div style={{flex:1,overflowY:"auto",padding:"16px 20px"}}>
-                <FieldsList sec={sec} isDesktop={true} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
+              <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"16px 20px"}}>
+                {showSummary?(
+                  <SummaryView form={form} values={values} isDesktop={true}/>
+                ):(
+                  <FieldsList sec={sec} isDesktop={true} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
+                )}
               </div>
             </div>
           ):(
             <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
               {/* Section tabs */}
-              {form.sections.length>1&&(
-                <div style={{display:"flex",overflowX:"auto",background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"0 8px",flexShrink:0}}>
-                  {form.sections.map((s,i)=>(
-                    <button key={s.id} onClick={()=>setActiveSec(i)} style={{padding:"7px 10px",border:"none",background:"transparent",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",fontFamily:"inherit",color:activeSec===i?C.indigo:C.textMut,borderBottom:activeSec===i?`2px solid ${C.indigo}`:"2px solid transparent"}}>{s.title||`§${i+1}`}</button>
-                  ))}
-                </div>
-              )}
-              <div style={{flex:1,overflowY:"auto",padding:"10px 10px"}}>
-                <FieldsList sec={sec} isDesktop={false} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
+              <div style={{display:"flex",overflowX:"auto",background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"0 8px",flexShrink:0}}>
+                {form.sections.map((s,i)=>(
+                  <button key={s.id} onClick={()=>setActiveSec(i)} style={{padding:"7px 10px",border:"none",background:"transparent",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",fontFamily:"inherit",color:activeSec===i?C.indigo:C.textMut,borderBottom:activeSec===i?`2px solid ${C.indigo}`:"2px solid transparent"}}>{s.title||`§${i+1}`}</button>
+                ))}
+                <button onClick={()=>setActiveSec("summary")} style={{padding:"7px 10px",border:"none",background:"transparent",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",fontFamily:"inherit",color:showSummary?C.indigo:C.textMut,borderBottom:showSummary?`2px solid ${C.indigo}`:"2px solid transparent"}}>📋 Summary</button>
+              </div>
+              <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"10px 10px"}}>
+                {showSummary?(
+                  <SummaryView form={form} values={values} isDesktop={false}/>
+                ):(
+                  <FieldsList sec={sec} isDesktop={false} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
+                )}
               </div>
               {/* Bottom nav */}
               <div style={{background:"#fff",padding:"8px 10px",borderTop:`1px solid ${C.border}`,display:"flex",gap:8,flexShrink:0}}>
-                <button onClick={()=>setActiveSec(s=>Math.max(0,s-1))} disabled={activeSec===0} style={{flex:1,padding:"7px",borderRadius:10,border:`1px solid ${C.border}`,background:"#fff",color:activeSec===0?C.textMut:C.text,cursor:activeSec===0?"default":"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>← Back</button>
-                {activeSec<form.sections.length-1?(
+                <button onClick={()=>setActiveSec(showSummary?form.sections.length-1:s=>Math.max(0,s-1))} disabled={!showSummary&&activeSec===0} style={{flex:1,padding:"7px",borderRadius:10,border:`1px solid ${C.border}`,background:"#fff",color:(!showSummary&&activeSec===0)?C.textMut:C.text,cursor:(!showSummary&&activeSec===0)?"default":"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>← Back</button>
+                {showSummary?(
+                  <button onClick={()=>alert("Submitted! (preview mode)")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.green,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>✓ Submit</button>
+                ):activeSec<form.sections.length-1?(
                   <button onClick={()=>setActiveSec(s=>s+1)} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>Next →</button>
                 ):(
-                  <button onClick={()=>alert("Submitted! (preview mode)")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.green,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>✓ Submit</button>
+                  <button onClick={()=>setActiveSec("summary")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>View Summary →</button>
                 )}
               </div>
             </div>
@@ -787,6 +1148,29 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                     <textarea placeholder={field.required?"Required — enter response…":"Enter response…"} value={getVal(field.id,"textfield")||""} onChange={e=>setVal(field.id,"textfield",e.target.value)} style={{...inp,minHeight:56,resize:"vertical",fontSize:12,borderColor:field.required&&!getVal(field.id,"textfield")?"#fca5a5":C.border}}/>
                   </div>
                 )}
+                {rt.includes("dropdown")&&(
+                  <div>
+                    {field.dropdownMulti?(
+                      <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                        {(field.dropdownOptions||[]).map(opt=>{
+                          const sel=(getVal(field.id,"dropdown")||[]).includes(opt);
+                          return (
+                            <button key={opt} onClick={()=>{
+                              const cur=getVal(field.id,"dropdown")||[];
+                              setVal(field.id,"dropdown", sel?cur.filter(x=>x!==opt):[...cur,opt]);
+                            }} style={{padding:"6px 12px",borderRadius:20,border:`1.5px solid ${sel?"#0369a1":C.border}`,background:sel?"#e0f2fe":"#fff",color:sel?"#0369a1":C.textSec,cursor:"pointer",fontSize:12,fontWeight:600,fontFamily:"inherit"}}>{opt}</button>
+                          );
+                        })}
+                        {(!field.dropdownOptions||field.dropdownOptions.length===0)&&<span style={{fontSize:11,color:C.textMut}}>No options configured</span>}
+                      </div>
+                    ):(
+                      <select value={getVal(field.id,"dropdown")||""} onChange={e=>setVal(field.id,"dropdown",e.target.value)} style={{...inp,fontSize:13}}>
+                        <option value="">Select…</option>
+                        {(field.dropdownOptions||[]).map(opt=><option key={opt} value={opt}>{opt}</option>)}
+                      </select>
+                    )}
+                  </div>
+                )}
                 {rt.includes("text")&&<CommentBlock field={field} getVal={getVal} setVal={setVal}/>}
                 {rt.includes("rating")&&(
                   <div style={{display:"flex",gap:4}}>
@@ -850,6 +1234,38 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                     />
                   </div>
                 )}
+                {rt.includes("matrix")&&(
+                  <div>
+                    {(!field.matrixColumns||field.matrixColumns.length===0)?(
+                      <div style={{fontSize:11,color:C.textMut}}>No columns configured for this grid yet.</div>
+                    ):(
+                      <div style={{display:"flex",flexWrap:"wrap",gap:isDesktop?12:8}}>
+                        {field.matrixColumns.map(col=>{
+                          const key=`matrix_${col}`;
+                          const val=getVal(field.id,key);
+                          return (
+                            <div key={col} style={{textAlign:"center",minWidth:field.matrixCellType==="passfail"?66:40}}>
+                              <div style={{fontSize:10,fontWeight:700,color:C.textSec,marginBottom:4}}>{col}</div>
+                              {field.matrixCellType==="checkbox"?(
+                                <div onClick={()=>setVal(field.id,key,!val)} style={{width:32,height:32,margin:"0 auto",borderRadius:7,border:`2px solid ${val?C.green:C.border}`,background:val?C.green:"#fff",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.15s"}}>
+                                  {val&&<span style={{color:"#fff",fontSize:15,fontWeight:900}}>✓</span>}
+                                </div>
+                              ):(
+                                <div style={{display:"flex",flexDirection:"column",gap:3}}>
+                                  {["Pass","Fail",...(field.naAllowed?["N/A"]:[])].map(full=>{
+                                    const sel=val===full;
+                                    const col2=full==="Pass"?C.green:full==="Fail"?C.red:C.slate;
+                                    return <button key={full} onClick={()=>setVal(field.id,key,full)} style={{padding:"3px 6px",borderRadius:6,border:`1.5px solid ${sel?col2:C.border}`,background:sel?col2:"#fff",color:sel?"#fff":C.textSec,cursor:"pointer",fontSize:10,fontWeight:700,fontFamily:"inherit"}}>{full==="N/A"?"N/A":full[0]}</button>;
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </Card>
           </div>
@@ -883,7 +1299,9 @@ Return ONLY a raw JSON object. Start with { end with }. No markdown, no commenta
           "helpText": "instruction note next to a check, OR the full body text for an info block",
           "required": false,
           "responseTypes": ["checkbox"],
-          "unit": null, "min": null, "max": null, "ratingMax": 5, "naAllowed": true
+          "unit": null, "min": null, "max": null, "ratingMax": 5, "naAllowed": true,
+          "dropdownOptions": [], "dropdownMulti": false,
+          "matrixColumns": [], "matrixCellType": "checkbox"
         }
       ]
     }
@@ -899,15 +1317,26 @@ IMPORTANT — set "kind" on every field to either "check" or "info":
 - "check" = anything requiring an actual response, tick, reading, or answer from the operator.
   For these, set responseTypes as below.
 
-responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, datetime, textfield, text, photo, rating
+responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, datetime, textfield, dropdown, text, photo, rating, matrix
 - checkbox = tick/done/complete
 - passfail = pass/fail/ok/not-ok
 - number = reading, measurement, temperature, pressure, level, count
 - datetime = a date and/or time field (e.g. "Date completed", "Time of check"). Also set "dtMode" to "date", "time", or "datetime" depending on what's asked for.
 - textfield = the check's actual response IS free text (e.g. "describe the fault", "operator name", "enter reading description") — always shown as an open text box
+- dropdown = the check offers a fixed list of choices to pick from (e.g. condition: Good/Worn/Damaged). Set "dropdownOptions" to the list of choices, and "dropdownMulti" to true only if more than one choice can apply at once.
 - text = an optional supplementary comment/note alongside another response type, not the primary answer — shown collapsed behind a "+ Comment" button unless marked required
 - photo = photograph or visual evidence required
 - rating = score or scale
+- matrix = THE SAME check repeated identically across several numbered/named items (e.g. a table
+  with check items down the left and columns like "#2 #3 #4 #5 #6 #7 #8 #9 #10" or "Kiln 1, Kiln 2,
+  Kiln 3" across the top, where every row needs one response PER COLUMN). Set "matrixColumns" to
+  the list of column headers exactly as shown, and "matrixCellType" to "checkbox" or "passfail"
+  depending on what each cell needs. Use this instead of creating separate fields per column.
+  IMPORTANT: within the same table, some rows may apply to every column (use "matrix") while other
+  rows are a single check spanning the whole width (use a normal "checkbox" or "passfail" field,
+  not "matrix") — look carefully at how many cells each row actually has, don't assume every row
+  in a table is a matrix row.
+
 For checks needing result + optional comment use ["passfail","text"]. For checks where free text IS the answer, use ["textfield"] (or combine with others as needed). Extract EVERY item, preserve ALL sections, and don't force informational content into a check just because it's easier — mark it "info" instead.`;
 
 // Shared JSON extraction + repair — handles markdown fences, stray preamble,
@@ -1210,6 +1639,31 @@ function FormEditorPage({form,onUpdate,onBack,onPreview,onExport,onSave,saving,d
   const [rightTab,setRightTab]=useState("fields"); // fields | approval
   const [lightbox,setLightbox]=useState(null);
 
+  // PDF photo gallery — extracted once per session, reused across every
+  // check's reference photo picker so the same PDF isn't re-processed
+  // each time.
+  const [pdfGallery,setPdfGallery]=useState([]);
+  const [galleryOpen,setGalleryOpen]=useState(false);
+  const [galleryOnPickRef,setGalleryOnPickRef]=useState(null); // wraps a fn so React state doesn't treat it as an updater
+  const [extracting,setExtracting]=useState(false);
+  const [extractProgress,setExtractProgress]=useState("");
+  const [extractError,setExtractError]=useState(null);
+
+  const openPdfGallery=(onPick)=>{ setGalleryOnPickRef(()=>onPick); setGalleryOpen(true); };
+  const handleExtractPdf=async(file)=>{
+    setExtracting(true); setExtractError(null);
+    try{
+      const results=await extractPdfImages(file, msg=>setExtractProgress(msg));
+      setPdfGallery(results);
+      if(results.length===0) setExtractError("No usable images found in that PDF.");
+    }catch(e){ setExtractError(e.message||"Couldn't process that PDF."); }
+    setExtracting(false);
+  };
+  const handlePickFromGallery=(dataUrl)=>{
+    galleryOnPickRef?.(dataUrl);
+    setGalleryOpen(false);
+  };
+
   const sec=form.sections.find(s=>s.id===activeSec)||form.sections[0];
   const totalFields=form.sections.reduce((a,s)=>a+s.fields.filter(f=>f.kind!=="info").length,0);
 
@@ -1236,6 +1690,17 @@ function FormEditorPage({form,onUpdate,onBack,onPreview,onExport,onSave,saving,d
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
       {lightbox&&<Lightbox src={lightbox} onClose={()=>setLightbox(null)}/>}
+      {galleryOpen&&(
+        <PdfPhotoPickerModal
+          gallery={pdfGallery}
+          extracting={extracting}
+          progress={extractProgress}
+          error={extractError}
+          onExtract={handleExtractPdf}
+          onPick={handlePickFromGallery}
+          onClose={()=>setGalleryOpen(false)}
+        />
+      )}
 
       {/* Editor sub-header */}
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"10px 20px",display:"flex",alignItems:"center",gap:10,flexShrink:0,flexWrap:"wrap"}}>
@@ -1309,7 +1774,7 @@ function FormEditorPage({form,onUpdate,onBack,onPreview,onExport,onSave,saving,d
             <input value={sec?.title||""} onChange={e=>updateSec({...sec,title:e.target.value})} style={{fontSize:18,fontWeight:700,border:"none",background:"transparent",color:C.text,outline:"none",flex:1,fontFamily:"inherit"}} placeholder="Section title…"/>
             <span style={{fontSize:12,color:C.textMut,flexShrink:0}}>{sec?.fields.length||0} checks</span>
           </div>
-          {sec&&<SectionEditor section={sec} onChange={updateSec} onLightbox={setLightbox}/>}
+          {sec&&<SectionEditor section={sec} onChange={updateSec} onLightbox={setLightbox} pdfGalleryCount={pdfGallery.length} onOpenPdfGallery={openPdfGallery}/>}
         </div>
 
         {/* ── Right panel: approval ── */}

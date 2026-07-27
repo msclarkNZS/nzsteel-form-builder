@@ -23,6 +23,7 @@ const RESP_TYPES = [
   { type:"checkbox", label:"Checkbox",   icon:"✓", color:C.green,  bg:C.greenLight  },
   { type:"passfail", label:"Pass/Fail",  icon:"◉", color:C.blue,   bg:C.blueLight   },
   { type:"number",   label:"Number",     icon:"#", color:C.amber,  bg:C.amberLight  },
+  { type:"datetime", label:"Date/Time",  icon:"📅",color:"#7c3aed",bg:"#ede9fe"      },
   { type:"textfield",label:"Text",       icon:"Aa",color:"#c2410c",bg:"#ffedd5"      },
   { type:"text",     label:"Comment",    icon:"✏", color:C.slate,  bg:C.slateLight  },
   { type:"photo",    label:"Photo",      icon:"📷",color:C.purple, bg:C.purpleLight },
@@ -43,10 +44,26 @@ const FORM_TAGS = ["Plant check","Lubrication","Safety","Electrical","Mechanical
 let _id = 200;
 const uid = () => `f${_id++}`;
 
+// ─── NZ date/time formatting ──────────────────────────────────────────────
+// Native <input type="date"/"time"> pickers use the OS/browser locale for
+// their own chrome, which we can't force — so we always show an explicit
+// NZ-formatted readout (DD/MM/YYYY, 24-hour time) next to the picker, to
+// remove any ambiguity about what was actually recorded.
+function formatNZDate(iso){ // iso: "YYYY-MM-DD"
+  if(!iso) return "";
+  const [y,m,d]=iso.split("-");
+  if(!y||!m||!d) return "";
+  return `${d}/${m}/${y}`;
+}
+function formatNZTime(t){ // t: "HH:MM" (already 24-hour from the native input)
+  if(!t) return "";
+  return t;
+}
+
 const newField = () => ({
   id:uid(), kind:"check", label:"", helpText:"", refDoc:"", refPhoto:null,
   required:false, responseTypes:["checkbox"],
-  unit:"", min:"", max:"", ratingMax:5, naAllowed:true,
+  unit:"", min:"", max:"", ratingMax:5, naAllowed:true, dtMode:"date",
 });
 
 const newInfoField = () => ({
@@ -158,6 +175,7 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
   const hasN=field.responseTypes.includes("number");
   const hasR=field.responseTypes.includes("rating");
   const hasPF=field.responseTypes.includes("passfail");
+  const hasDT=field.responseTypes.includes("datetime");
 
   const toggleKind=()=>{
     if(isInfo) onChange({...field,kind:"check",responseTypes:field.responseTypes.length?field.responseTypes:["checkbox"]});
@@ -222,11 +240,12 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox}){
                 <label style={lbl}>Response types <span style={{fontWeight:400,color:C.textMut,textTransform:"none"}}>(mix & match)</span></label>
                 <RespTypeChips selected={field.responseTypes} onChange={v=>onChange({...field,responseTypes:v})}/>
               </div>
-              {(hasN||hasR||hasPF)&&(
+              {(hasN||hasR||hasPF||hasDT)&&(
                 <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10,padding:"10px 12px",background:C.slateLight,borderRadius:8}}>
                   {hasN&&<><div style={{minWidth:70}}><label style={lbl}>Unit</label><Input value={field.unit} placeholder="°C" onChange={e=>onChange({...field,unit:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Min</label><Input value={field.min} placeholder="0" type="number" onChange={e=>onChange({...field,min:e.target.value})}/></div><div style={{minWidth:60}}><label style={lbl}>Max</label><Input value={field.max} placeholder="100" type="number" onChange={e=>onChange({...field,max:e.target.value})}/></div></>}
                   {hasR&&<div><label style={lbl}>Rating max</label><div style={{display:"flex",gap:4}}>{[3,4,5,10].map(n=><button key={n} onClick={()=>onChange({...field,ratingMax:n})} style={{width:32,height:32,borderRadius:8,border:`1.5px solid ${field.ratingMax===n?C.indigo:C.border}`,background:field.ratingMax===n?C.indigoLight:"#fff",color:field.ratingMax===n?C.indigo:C.textSec,cursor:"pointer",fontWeight:700,fontSize:12}}>{n}</button>)}</div></div>}
                   {hasPF&&<div style={{alignSelf:"flex-end",paddingBottom:2}}><label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}><input type="checkbox" checked={field.naAllowed} onChange={e=>onChange({...field,naAllowed:e.target.checked})}/><span style={{fontSize:12,color:C.textSec}}>Allow N/A</span></label></div>}
+                  {hasDT&&<div><label style={lbl}>Capture</label><div style={{display:"flex",gap:4}}>{[{v:"date",l:"Date"},{v:"time",l:"Time"},{v:"datetime",l:"Date & Time"}].map(o=><button key={o.v} onClick={()=>onChange({...field,dtMode:o.v})} style={{padding:"6px 10px",borderRadius:8,border:`1.5px solid ${field.dtMode===o.v?"#7c3aed":C.border}`,background:field.dtMode===o.v?"#ede9fe":"#fff",color:field.dtMode===o.v?"#7c3aed":C.textSec,cursor:"pointer",fontWeight:700,fontSize:11,fontFamily:"inherit"}}>{o.l}</button>)}</div></div>}
                 </div>
               )}
             </>)}
@@ -745,6 +764,24 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                     {field.unit&&<span style={{fontSize:12,color:C.textSec,fontWeight:500,flexShrink:0}}>{field.unit}</span>}
                   </div>
                 )}
+                {rt.includes("datetime")&&(
+                  <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                    <div style={{display:"flex",gap:8}}>
+                      {(field.dtMode==="date"||field.dtMode==="datetime"||!field.dtMode)&&(
+                        <div style={{flex:1}}>
+                          <input type="date" value={getVal(field.id,"date")||""} onChange={e=>setVal(field.id,"date",e.target.value)} style={{...inp,fontSize:13}}/>
+                          {getVal(field.id,"date")&&<div style={{fontSize:10,color:"#7c3aed",fontWeight:700,marginTop:3}}>{formatNZDate(getVal(field.id,"date"))} (NZ)</div>}
+                        </div>
+                      )}
+                      {(field.dtMode==="time"||field.dtMode==="datetime")&&(
+                        <div style={{flex:1}}>
+                          <input type="time" value={getVal(field.id,"time")||""} onChange={e=>setVal(field.id,"time",e.target.value)} style={{...inp,fontSize:13}}/>
+                          {getVal(field.id,"time")&&<div style={{fontSize:10,color:"#7c3aed",fontWeight:700,marginTop:3}}>{formatNZTime(getVal(field.id,"time"))} (24hr)</div>}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {rt.includes("textfield")&&(
                   <div>
                     <textarea placeholder={field.required?"Required — enter response…":"Enter response…"} value={getVal(field.id,"textfield")||""} onChange={e=>setVal(field.id,"textfield",e.target.value)} style={{...inp,minHeight:56,resize:"vertical",fontSize:12,borderColor:field.required&&!getVal(field.id,"textfield")?"#fca5a5":C.border}}/>
@@ -862,10 +899,11 @@ IMPORTANT — set "kind" on every field to either "check" or "info":
 - "check" = anything requiring an actual response, tick, reading, or answer from the operator.
   For these, set responseTypes as below.
 
-responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, textfield, text, photo, rating
+responseTypes (only for kind:"check"): pick one or more from: checkbox, passfail, number, datetime, textfield, text, photo, rating
 - checkbox = tick/done/complete
 - passfail = pass/fail/ok/not-ok
 - number = reading, measurement, temperature, pressure, level, count
+- datetime = a date and/or time field (e.g. "Date completed", "Time of check"). Also set "dtMode" to "date", "time", or "datetime" depending on what's asked for.
 - textfield = the check's actual response IS free text (e.g. "describe the fault", "operator name", "enter reading description") — always shown as an open text box
 - text = an optional supplementary comment/note alongside another response type, not the primary answer — shown collapsed behind a "+ Comment" button unless marked required
 - photo = photograph or visual evidence required

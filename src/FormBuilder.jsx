@@ -167,6 +167,7 @@ const newField = () => ({
   unit:"", min:"", max:"", ratingMax:5, naAllowed:true, dtMode:"date",
   dropdownOptions:[], dropdownMulti:false,
   matrixColumns:[], matrixCellType:"checkbox",
+  excludeFromSummary:false, summaryRole:"", // "" | "operatorName" | "completionDate"
 });
 
 const newInfoField = () => ({
@@ -520,6 +521,23 @@ function FieldCard({field,onChange,onDelete,dragHandlers,onLightbox,pdfGalleryCo
               )}
             </>)}
 
+            {!isInfo&&(
+              <div style={{display:"flex",gap:14,alignItems:"center",flexWrap:"wrap",marginBottom:10,padding:"8px 12px",background:C.slateLight,borderRadius:8}}>
+                <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,color:C.textSec}}>
+                  <input type="checkbox" checked={!!field.excludeFromSummary} onChange={e=>onChange({...field,excludeFromSummary:e.target.checked})}/>
+                  Exclude from summary
+                </label>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:11,color:C.textMut}}>Use as:</span>
+                  <select value={field.summaryRole||""} onChange={e=>onChange({...field,summaryRole:e.target.value})} style={{...inp,width:"auto",padding:"4px 8px",fontSize:11}}>
+                    <option value="">—</option>
+                    <option value="operatorName">Operator name (shown in summary header)</option>
+                    <option value="completionDate">Completion date (shown in summary header)</option>
+                  </select>
+                </div>
+              </div>
+            )}
+
             <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between"}}>
               <RefPhotoPicker value={field.refPhoto} onChange={v=>onChange({...field,refPhoto:v})} onLightbox={onLightbox} pdfGalleryCount={pdfGalleryCount} onOpenPdfGallery={onOpenPdfGallery?()=>onOpenPdfGallery(v=>onChange({...field,refPhoto:v})):undefined}/>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -542,8 +560,22 @@ function SectionEditor({section,onChange,onLightbox,pdfGalleryCount,onOpenPdfGal
   const addInfoField=()=>onChange({...section,fields:[...section.fields,newInfoField()]});
   const upd=(i,f)=>{const fs=[...section.fields];fs[i]=f;onChange({...section,fields:fs});};
   const del=i=>onChange({...section,fields:section.fields.filter((_,j)=>j!==i)});
+  const hasMatrixFields=section.fields.some(f=>f.responseTypes.includes("matrix"));
+  const orientation=section.matrixOrientation||"byCheck";
   return (
     <div>
+      {hasMatrixFields&&(
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,padding:"9px 12px",background:"#fdf2f8",border:"1px solid #fbcfe8",borderRadius:8,flexWrap:"wrap"}}>
+          <span style={{fontSize:11,fontWeight:700,color:"#9d174d"}}>Per-item grid — operator sees:</span>
+          <div style={{display:"flex",gap:4}}>
+            <button onClick={()=>onChange({...section,matrixOrientation:"byCheck"})} style={{padding:"5px 11px",borderRadius:7,border:`1.5px solid ${orientation==="byCheck"?"#be185d":C.border}`,background:orientation==="byCheck"?"#fce7f3":"#fff",color:orientation==="byCheck"?"#be185d":C.textSec,cursor:"pointer",fontWeight:600,fontSize:11,fontFamily:"inherit"}}>One check, all items</button>
+            <button onClick={()=>onChange({...section,matrixOrientation:"byItem"})} style={{padding:"5px 11px",borderRadius:7,border:`1.5px solid ${orientation==="byItem"?"#be185d":C.border}`,background:orientation==="byItem"?"#fce7f3":"#fff",color:orientation==="byItem"?"#be185d":C.textSec,cursor:"pointer",fontWeight:600,fontSize:11,fontFamily:"inherit"}}>One item, all checks</button>
+          </div>
+          <span style={{fontSize:10,color:"#9d174d",opacity:0.8}}>
+            {orientation==="byItem"?"— operator picks a burner/unit, then runs through every check for it":"— operator runs through checks, ticking each column as they go"}
+          </span>
+        </div>
+      )}
       {section.fields.map((f,i)=>(
         <FieldCard key={f.id} field={f} onChange={u=>upd(i,u)} onDelete={()=>del(i)} onLightbox={onLightbox}
           pdfGalleryCount={pdfGalleryCount} onOpenPdfGallery={onOpenPdfGallery}
@@ -648,12 +680,36 @@ const DEVICES=[
 ];
 
 // ─── Review summary — failed checks & anything with a comment ──────────────
+function getFieldDisplayValue(field, values){
+  const rt=field.responseTypes;
+  if(rt.includes("textfield")&&values[`${field.id}_textfield`]) return values[`${field.id}_textfield`];
+  if(rt.includes("dropdown")&&values[`${field.id}_dropdown`]){
+    const v=values[`${field.id}_dropdown`];
+    return Array.isArray(v)?v.join(", "):v;
+  }
+  if(rt.includes("datetime")){
+    const d=values[`${field.id}_date`], t=values[`${field.id}_time`];
+    const parts=[]; if(d) parts.push(formatNZDate(d)); if(t) parts.push(formatNZTime(t));
+    if(parts.length) return parts.join(" ");
+  }
+  if(rt.includes("text")&&values[`${field.id}_text`]) return values[`${field.id}_text`];
+  return "";
+}
+
 function buildFormSummary(form, values){
   const failures=[];
   const comments=[];
+  let operatorName="", completionDate="";
+
   form.sections.forEach(sec=>{
     sec.fields.forEach(field=>{
       if(field.kind==="info") return;
+
+      if(field.summaryRole==="operatorName"&&!operatorName) operatorName=getFieldDisplayValue(field,values);
+      if(field.summaryRole==="completionDate"&&!completionDate) completionDate=getFieldDisplayValue(field,values);
+
+      if(field.excludeFromSummary) return;
+
       const rt=field.responseTypes;
       const label=field.label||"Untitled check";
 
@@ -663,6 +719,14 @@ function buildFormSummary(form, values){
       if(rt.includes("matrix")&&field.matrixCellType==="passfail"){
         (field.matrixColumns||[]).forEach(col=>{
           if(values[`${field.id}_matrix_${col}`]==="Fail") failures.push({section:sec.title,label,detail:col});
+        });
+      }
+      // Per-cell notes on failed matrix items
+      if(rt.includes("matrix")){
+        (field.matrixColumns||[]).forEach(col=>{
+          const c=values[`${field.id}_matrix_${col}_comment`];
+          const p=values[`${field.id}_matrix_${col}_commentPhoto`];
+          if(c||p) comments.push({section:sec.title,label:`${label} — ${col}`,text:c,hasPhoto:!!p});
         });
       }
 
@@ -675,14 +739,25 @@ function buildFormSummary(form, values){
       }
     });
   });
-  return {failures,comments};
+  return {failures,comments,operatorName,completionDate};
 }
 
 function SummaryView({form,values,isDesktop}){
-  const {failures,comments}=buildFormSummary(form,values);
+  const {failures,comments,operatorName,completionDate}=buildFormSummary(form,values);
   const allClear=failures.length===0&&comments.length===0;
   return (
     <div style={{padding:isDesktop?"16px 20px":"10px"}}>
+      <div style={{padding:"12px 14px",background:"#fff",border:`1px solid ${C.border}`,borderRadius:10,marginBottom:16}}>
+        <div style={{fontSize:isDesktop?15:13,fontWeight:700,color:C.text}}>{form.title||"Untitled form"}</div>
+        {form.docRef&&<div style={{fontSize:10,fontFamily:"monospace",color:"#92400e",background:C.amberLight,display:"inline-block",padding:"1px 7px",borderRadius:5,marginTop:4,border:"1px solid #fcd34d"}}>{form.docRef}</div>}
+        {(operatorName||completionDate)&&(
+          <div style={{display:"flex",gap:16,marginTop:8,fontSize:11,color:C.textSec,flexWrap:"wrap"}}>
+            {operatorName&&<div><span style={{fontWeight:700,color:C.text}}>Operator: </span>{operatorName}</div>}
+            {completionDate&&<div><span style={{fontWeight:700,color:C.text}}>Date: </span>{completionDate}</div>}
+          </div>
+        )}
+      </div>
+
       <div style={{fontSize:isDesktop?16:14,fontWeight:700,color:C.text,marginBottom:4}}>Review before submitting</div>
       <div style={{fontSize:12,color:C.textSec,marginBottom:16}}>{failures.length} failed check{failures.length!==1?"s":""} · {comments.length} comment{comments.length!==1?"s":""}</div>
 
@@ -717,6 +792,73 @@ function SummaryView({form,values,isDesktop}){
             </div>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ─── "By item" rotation — operator picks a burner/unit, sees every check ───
+// for it in one place, instead of one check at a time across all units.
+function MatrixByItemView({section,isDesktop,values,photos,setPhotos,setVal,getVal,handlePhoto,fileRefs,activeSec,totalSections,setActiveSec,form}){
+  const matrixFields=section.fields.filter(f=>f.kind!=="info"&&f.responseTypes.includes("matrix"));
+  const otherFields=section.fields.filter(f=>f.kind==="info"||!f.responseTypes.includes("matrix"));
+  const items=[];
+  matrixFields.forEach(f=>(f.matrixColumns||[]).forEach(c=>{ if(!items.includes(c)) items.push(c); }));
+  const [activeItem,setActiveItem]=useState(items[0]||null);
+  useEffect(()=>{ if(items.length&&!items.includes(activeItem)) setActiveItem(items[0]); },[items.join("|")]);
+
+  const otherSec={...section,fields:otherFields};
+
+  return (
+    <div>
+      {otherFields.length>0&&(
+        <div style={{marginBottom:16}}>
+          <FieldsList sec={otherSec} isDesktop={isDesktop} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={totalSections} setActiveSec={setActiveSec} form={form}/>
+        </div>
+      )}
+      {items.length===0?(
+        <div style={{fontSize:11,color:C.textMut}}>No columns configured on the per-item grid checks in this section yet.</div>
+      ):(
+        <>
+          <div style={{display:"flex",gap:6,overflowX:"auto",marginBottom:12,paddingBottom:2}}>
+            {items.map(it=>(
+              <button key={it} onClick={()=>setActiveItem(it)} style={{padding:"7px 14px",borderRadius:20,border:`1.5px solid ${activeItem===it?"#be185d":C.border}`,background:activeItem===it?"#fce7f3":"#fff",color:activeItem===it?"#be185d":C.textSec,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>{it}</button>
+            ))}
+          </div>
+          {matrixFields.filter(f=>(f.matrixColumns||[]).includes(activeItem)).map(f=>{
+            const cellKey=`matrix_${activeItem}`;
+            const val=getVal(f.id,cellKey);
+            const isFail=f.matrixCellType==="passfail"&&val==="Fail";
+            return (
+              <div key={f.id} style={{marginBottom:10}}>
+                <Card style={{padding:isDesktop?14:11}}>
+                  <div style={{fontSize:isDesktop?13:12,fontWeight:600,color:C.text,marginBottom:8}}>{f.label||"Untitled check"}</div>
+                  {f.matrixCellType==="checkbox"?(
+                    <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+                      <div onClick={()=>setVal(f.id,cellKey,!val)} style={{width:24,height:24,borderRadius:6,border:`2px solid ${val?C.green:C.border}`,background:val?C.green:"#fff",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.15s"}}>
+                        {val&&<span style={{color:"#fff",fontSize:14,fontWeight:900}}>✓</span>}
+                      </div>
+                      <span style={{fontSize:12,color:C.textSec}}>Done / confirmed</span>
+                    </label>
+                  ):(
+                    <div style={{display:"flex",gap:6}}>
+                      {["Pass","Fail",...(f.naAllowed?["N/A"]:[])].map(opt=>{
+                        const sel=val===opt;
+                        const col2=opt==="Pass"?C.green:opt==="Fail"?C.red:C.slate;
+                        return <button key={opt} onClick={()=>setVal(f.id,cellKey,opt)} style={{flex:1,padding:"7px 4px",borderRadius:8,border:`1.5px solid ${sel?col2:C.border}`,background:sel?col2:"#fff",color:sel?"#fff":C.textSec,cursor:"pointer",fontSize:12,fontWeight:600,fontFamily:"inherit"}}>{opt}</button>;
+                      })}
+                    </div>
+                  )}
+                  {isFail&&(
+                    <div style={{marginTop:8}}>
+                      <MatrixCellNote fieldId={f.id} itemKey={cellKey} getVal={getVal} setVal={setVal} label={null}/>
+                    </div>
+                  )}
+                </Card>
+              </div>
+            );
+          })}
+        </>
       )}
     </div>
   );
@@ -807,6 +949,8 @@ function DevicePreview({form,onClose}){
               <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"16px 20px"}}>
                 {showSummary?(
                   <SummaryView form={form} values={values} isDesktop={true}/>
+                ):sec&&sec.matrixOrientation==="byItem"?(
+                  <MatrixByItemView section={sec} isDesktop={true} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
                 ):(
                   <FieldsList sec={sec} isDesktop={true} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
                 )}
@@ -824,6 +968,8 @@ function DevicePreview({form,onClose}){
               <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"10px 10px"}}>
                 {showSummary?(
                   <SummaryView form={form} values={values} isDesktop={false}/>
+                ):sec&&sec.matrixOrientation==="byItem"?(
+                  <MatrixByItemView section={sec} isDesktop={false} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
                 ):(
                   <FieldsList sec={sec} isDesktop={false} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
                 )}
@@ -1049,6 +1195,51 @@ function CommentBlock({field,getVal,setVal}){
   );
 }
 
+// ─── Per-cell note — comment + photo scoped to one failed matrix cell ──────
+function MatrixCellNote({fieldId,itemKey,getVal,setVal,label}){
+  const commentKey=`${itemKey}_comment`;
+  const photoKey=`${itemKey}_commentPhoto`;
+  const existingText=getVal(fieldId,commentKey)||"";
+  const existingPhoto=getVal(fieldId,photoKey);
+  const [open,setOpen]=useState(!!existingText||!!existingPhoto);
+  const fileRef=useRef();
+
+  const handlePhoto=e=>{
+    const file=e.target.files[0]; if(!file) return;
+    const r=new FileReader();
+    r.onload=()=>setVal(fieldId,photoKey,r.result);
+    r.readAsDataURL(file);
+  };
+
+  if(!open){
+    return (
+      <button onClick={()=>setOpen(true)} style={{padding:"3px 9px",borderRadius:14,border:`1px dashed ${C.red}`,background:"#fff",color:C.red,cursor:"pointer",fontSize:10,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:4}}>
+        + Note{label?` — ${label}`:""}
+      </button>
+    );
+  }
+
+  return (
+    <div style={{marginTop:4,padding:"8px 10px",background:C.redLight,border:"1px solid #fca5a5",borderRadius:8}}>
+      {label&&<div style={{fontSize:10,fontWeight:700,color:"#991b1b",marginBottom:4}}>Note — {label}</div>}
+      <textarea autoFocus placeholder="What's wrong…" value={existingText} onChange={e=>setVal(fieldId,commentKey,e.target.value)} style={{...inp,minHeight:40,resize:"vertical",fontSize:11}}/>
+      <div style={{marginTop:5}}>
+        {existingPhoto?(
+          <div style={{position:"relative",display:"inline-block"}}>
+            <img src={existingPhoto} alt="note attachment" style={{width:80,height:56,objectFit:"cover",borderRadius:6,border:`1px solid ${C.border}`,display:"block"}}/>
+            <button onClick={()=>setVal(fieldId,photoKey,null)} style={{position:"absolute",top:2,right:2,width:16,height:16,borderRadius:"50%",background:C.red,color:"#fff",border:"none",cursor:"pointer",fontSize:9,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+          </div>
+        ):(
+          <>
+            <button onClick={()=>fileRef.current.click()} style={{padding:"4px 8px",borderRadius:6,border:`1px dashed ${C.border}`,background:"#fff",color:C.textSec,cursor:"pointer",fontSize:10,fontWeight:600,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:4}}>📷 Add photo</button>
+            <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={handlePhoto}/>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handlePhoto,fileRefs,activeSec,totalSections,setActiveSec,form}){
   const [lb,setLb]=useState(null);
   const [photoMarkup,setPhotoMarkup]=useState({});
@@ -1239,30 +1430,39 @@ function FieldsList({sec,isDesktop,values,photos,setPhotos,setVal,getVal,handleP
                     {(!field.matrixColumns||field.matrixColumns.length===0)?(
                       <div style={{fontSize:11,color:C.textMut}}>No columns configured for this grid yet.</div>
                     ):(
-                      <div style={{display:"flex",flexWrap:"wrap",gap:isDesktop?12:8}}>
-                        {field.matrixColumns.map(col=>{
-                          const key=`matrix_${col}`;
-                          const val=getVal(field.id,key);
-                          return (
-                            <div key={col} style={{textAlign:"center",minWidth:field.matrixCellType==="passfail"?66:40}}>
-                              <div style={{fontSize:10,fontWeight:700,color:C.textSec,marginBottom:4}}>{col}</div>
-                              {field.matrixCellType==="checkbox"?(
-                                <div onClick={()=>setVal(field.id,key,!val)} style={{width:32,height:32,margin:"0 auto",borderRadius:7,border:`2px solid ${val?C.green:C.border}`,background:val?C.green:"#fff",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.15s"}}>
-                                  {val&&<span style={{color:"#fff",fontSize:15,fontWeight:900}}>✓</span>}
-                                </div>
-                              ):(
-                                <div style={{display:"flex",flexDirection:"column",gap:3}}>
-                                  {["Pass","Fail",...(field.naAllowed?["N/A"]:[])].map(full=>{
-                                    const sel=val===full;
-                                    const col2=full==="Pass"?C.green:full==="Fail"?C.red:C.slate;
-                                    return <button key={full} onClick={()=>setVal(field.id,key,full)} style={{padding:"3px 6px",borderRadius:6,border:`1.5px solid ${sel?col2:C.border}`,background:sel?col2:"#fff",color:sel?"#fff":C.textSec,cursor:"pointer",fontSize:10,fontWeight:700,fontFamily:"inherit"}}>{full==="N/A"?"N/A":full[0]}</button>;
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
+                      <>
+                        <div style={{display:"flex",flexWrap:"wrap",gap:isDesktop?12:8}}>
+                          {field.matrixColumns.map(col=>{
+                            const key=`matrix_${col}`;
+                            const val=getVal(field.id,key);
+                            return (
+                              <div key={col} style={{textAlign:"center",minWidth:field.matrixCellType==="passfail"?66:40}}>
+                                <div style={{fontSize:10,fontWeight:700,color:C.textSec,marginBottom:4}}>{col}</div>
+                                {field.matrixCellType==="checkbox"?(
+                                  <div onClick={()=>setVal(field.id,key,!val)} style={{width:32,height:32,margin:"0 auto",borderRadius:7,border:`2px solid ${val?C.green:C.border}`,background:val?C.green:"#fff",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"all 0.15s"}}>
+                                    {val&&<span style={{color:"#fff",fontSize:15,fontWeight:900}}>✓</span>}
+                                  </div>
+                                ):(
+                                  <div style={{display:"flex",flexDirection:"column",gap:3}}>
+                                    {["Pass","Fail",...(field.naAllowed?["N/A"]:[])].map(full=>{
+                                      const sel=val===full;
+                                      const col2=full==="Pass"?C.green:full==="Fail"?C.red:C.slate;
+                                      return <button key={full} onClick={()=>setVal(field.id,key,full)} style={{padding:"3px 6px",borderRadius:6,border:`1.5px solid ${sel?col2:C.border}`,background:sel?col2:"#fff",color:sel?"#fff":C.textSec,cursor:"pointer",fontSize:10,fontWeight:700,fontFamily:"inherit"}}>{full==="N/A"?"N/A":full[0]}</button>;
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {field.matrixCellType==="passfail"&&field.matrixColumns.some(col=>getVal(field.id,`matrix_${col}`)==="Fail")&&(
+                          <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:8}}>
+                            {field.matrixColumns.filter(col=>getVal(field.id,`matrix_${col}`)==="Fail").map(col=>(
+                              <MatrixCellNote key={col} fieldId={field.id} itemKey={`matrix_${col}`} getVal={getVal} setVal={setVal} label={col}/>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}

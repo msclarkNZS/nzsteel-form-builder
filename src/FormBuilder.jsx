@@ -74,6 +74,37 @@ function formatNZDateTime(iso){ // full ISO timestamp -> DD/MM/YYYY HH:MM, NZ st
   return `${dd}/${mm}/${yyyy} ${hh}:${min}`;
 }
 
+// ─── Submission photo upload ─────────────────────────────────────────────────
+// Walks a flat object (the `values` or `photos` map collected while filling
+// in a form) and uploads any base64 image data URLs to a Supabase Storage
+// bucket, replacing them with the resulting public URL. Everything else
+// (text, numbers, dropdown picks, etc.) passes through untouched. This is
+// what keeps `form_submissions` rows small — photos live in Storage, not
+// as base64 blobs inside jsonb.
+async function uploadDataUrlsInObject(obj, basePath){
+  const out={};
+  for(const [key,val] of Object.entries(obj||{})){
+    if(typeof val==="string"&&val.startsWith("data:image")){
+      try{
+        const res=await fetch(val);
+        const blob=await res.blob();
+        const ext=(blob.type.split("/")[1]||"png").split("+")[0];
+        const path=`${basePath}/${key}.${ext}`;
+        const {error}=await supabase.storage.from("submission-photos").upload(path,blob,{contentType:blob.type,upsert:true});
+        if(error) throw error;
+        const {data}=supabase.storage.from("submission-photos").getPublicUrl(path);
+        out[key]=data.publicUrl;
+      }catch(e){
+        console.error("Photo upload failed for",key,e);
+        out[key]=val; // fall back to embedding the photo rather than losing it
+      }
+    }else{
+      out[key]=val;
+    }
+  }
+  return out;
+}
+
 // ─── PDF photo extraction ─────────────────────────────────────────────────
 // Runs entirely in the browser via pdf.js — no API calls, no billing.
 // Pulls out (a) the actual embedded raster images inside the PDF, and
@@ -961,14 +992,24 @@ function DevicePreview({form,onClose}){
   const handleSubmit=async()=>{
     setSaving(true); setSaveError(null);
     const {operatorName}=buildFormSummary(form,values);
+    const submissionId=(typeof crypto!=="undefined"&&crypto.randomUUID)?crypto.randomUUID():uid();
+    const basePath=`${form.id}/${submissionId}`;
+    let uploadedValues, uploadedPhotos;
+    try{
+      uploadedValues=await uploadDataUrlsInObject(values,basePath);
+      uploadedPhotos=await uploadDataUrlsInObject(photos,basePath);
+    }catch(e){
+      setSaving(false); setSaveError("Photo upload failed: "+e.message); return;
+    }
     const row={
+      id:submissionId,
       form_id:form.id,
       form_title:form.title||"",
       form_doc_ref:form.docRef||"",
       form_version:form.version||"1.0",
       submitted_by:operatorName||null,
-      responses:values,
-      photos:photos,
+      responses:uploadedValues,
+      photos:uploadedPhotos,
     };
     const {error}=await supabase.from("form_submissions").insert(row);
     setSaving(false);

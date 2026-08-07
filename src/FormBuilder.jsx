@@ -62,6 +62,17 @@ function formatNZTime(t){ // t: "HH:MM" (already 24-hour from the native input)
   if(!t) return "";
   return t;
 }
+function formatNZDateTime(iso){ // full ISO timestamp -> DD/MM/YYYY HH:MM, NZ style
+  if(!iso) return "";
+  const d=new Date(iso);
+  if(isNaN(d.getTime())) return "";
+  const dd=String(d.getDate()).padStart(2,"0");
+  const mm=String(d.getMonth()+1).padStart(2,"0");
+  const yyyy=d.getFullYear();
+  const hh=String(d.getHours()).padStart(2,"0");
+  const min=String(d.getMinutes()).padStart(2,"0");
+  return `${dd}/${mm}/${yyyy} ${hh}:${min}`;
+}
 
 // ─── PDF photo extraction ─────────────────────────────────────────────────
 // Runs entirely in the browser via pdf.js — no API calls, no billing.
@@ -797,6 +808,78 @@ function SummaryView({form,values,isDesktop}){
   );
 }
 
+// ─── Submissions browser — view completed results for a form ───────────────
+function SubmissionsModal({form,onClose}){
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState(null);
+  const [rows,setRows]=useState([]);
+  const [selected,setSelected]=useState(null);
+
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      setLoading(true); setError(null);
+      const {data,error}=await supabase.from("form_submissions").select("*").eq("form_id",form.id).order("submitted_at",{ascending:false});
+      if(cancelled) return;
+      if(error){ setError(error.message); setLoading(false); return; }
+      setRows(data||[]);
+      setLoading(false);
+    })();
+    return ()=>{cancelled=true;};
+  },[form.id]);
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.6)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:250,padding:24}}>
+      <Card style={{width:640,maxHeight:"85vh",display:"flex",flexDirection:"column",padding:0}}>
+        <div style={{padding:"16px 20px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10}}>
+          {selected&&<button onClick={()=>setSelected(null)} style={{background:"none",border:"none",cursor:"pointer",color:C.textSec,fontSize:13}}>← Back</button>}
+          <div>
+            <div style={{fontSize:15,fontWeight:700,color:C.text}}>{selected?"Submission detail":"Submissions"}</div>
+            <div style={{fontSize:12,color:C.textSec}}>{form.title||"Untitled form"}</div>
+          </div>
+          <Btn variant="ghost" size="sm" onClick={onClose} style={{marginLeft:"auto"}}>Close</Btn>
+        </div>
+
+        <div style={{flex:1,overflowY:"auto",padding:selected?0:"14px 20px"}}>
+          {loading&&<div style={{textAlign:"center",padding:"40px 20px",color:C.textMut,fontSize:13}}>Loading…</div>}
+          {error&&<div style={{padding:"12px 16px",borderRadius:8,border:"1px solid #fca5a5",background:C.redLight,color:C.red,fontSize:13}}>{error}</div>}
+
+          {!loading&&!error&&!selected&&(
+            rows.length===0?(
+              <div style={{textAlign:"center",padding:"40px 20px",color:C.textMut}}>
+                <div style={{fontSize:32,marginBottom:8}}>📭</div>
+                <div style={{fontSize:13}}>No submissions yet for this form.</div>
+              </div>
+            ):(
+              rows.map(row=>{
+                const {failures,comments}=buildFormSummary(form,row.responses||{});
+                return (
+                  <div key={row.id} onClick={()=>setSelected(row)} style={{padding:"12px 14px",borderRadius:10,border:`1px solid ${C.border}`,marginBottom:8,cursor:"pointer",transition:"border-color 0.15s"}}
+                    onMouseEnter={e=>e.currentTarget.style.borderColor=C.indigo} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,fontWeight:600,color:C.text}}>{row.submitted_by||"Unknown operator"}</div>
+                        <div style={{fontSize:11,color:C.textMut}}>{formatNZDateTime(row.submitted_at)}</div>
+                      </div>
+                      {failures.length>0&&<Badge color={C.red} bg={C.redLight}>❌ {failures.length}</Badge>}
+                      {comments.length>0&&<Badge color={C.textSec} bg={C.slateLight}>💬 {comments.length}</Badge>}
+                      {failures.length===0&&comments.length===0&&<Badge color={C.green} bg={C.greenLight}>✓ Clear</Badge>}
+                    </div>
+                  </div>
+                );
+              })
+            )
+          )}
+
+          {selected&&(
+            <SummaryView form={form} values={selected.responses||{}} isDesktop={true}/>
+          )}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // ─── "By item" rotation — operator picks a burner/unit, sees every check ───
 // for it in one place, instead of one check at a time across all units.
 function MatrixByItemView({section,isDesktop,values,photos,setPhotos,setVal,getVal,handlePhoto,fileRefs,activeSec,totalSections,setActiveSec,form}){
@@ -869,8 +952,29 @@ function DevicePreview({form,onClose}){
   const [values,setValues]=useState({});
   const [photos,setPhotos]=useState({});
   const [activeSec,setActiveSec]=useState(0);
+  const [saving,setSaving]=useState(false);
+  const [saveError,setSaveError]=useState(null);
+  const [submitted,setSubmitted]=useState(false);
   const fileRefs=useRef({});
   const dev=DEVICES.find(d=>d.id===devId);
+
+  const handleSubmit=async()=>{
+    setSaving(true); setSaveError(null);
+    const {operatorName}=buildFormSummary(form,values);
+    const row={
+      form_id:form.id,
+      form_title:form.title||"",
+      form_doc_ref:form.docRef||"",
+      form_version:form.version||"1.0",
+      submitted_by:operatorName||null,
+      responses:values,
+      photos:photos,
+    };
+    const {error}=await supabase.from("form_submissions").insert(row);
+    setSaving(false);
+    if(error){ setSaveError(error.message); return; }
+    setSubmitted(true);
+  };
 
   // Scale to fit viewport
   const maxW=Math.min(window.innerWidth-160, dev.w);
@@ -946,9 +1050,21 @@ function DevicePreview({form,onClose}){
                 </div>
               </div>
               {/* Fields */}
-              <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"16px 20px"}}>
-                {showSummary?(
-                  <SummaryView form={form} values={values} isDesktop={true}/>
+              <div style={{flex:1,overflowY:"auto",padding:submitted?0:showSummary?0:"16px 20px"}}>
+                {submitted?(
+                  <div style={{textAlign:"center",padding:"60px 20px"}}>
+                    <div style={{fontSize:48,marginBottom:16}}>✅</div>
+                    <div style={{fontSize:16,fontWeight:700,color:C.text,marginBottom:6}}>Submitted</div>
+                    <div style={{fontSize:13,color:C.textSec}}>This result has been saved.</div>
+                  </div>
+                ):showSummary?(
+                  <>
+                    <SummaryView form={form} values={values} isDesktop={true}/>
+                    <div style={{padding:"0 20px 20px"}}>
+                      {saveError&&<div style={{fontSize:12,color:C.red,background:C.redLight,border:"1px solid #fca5a5",borderRadius:8,padding:"8px 12px",marginBottom:10}}>⚠ {saveError}</div>}
+                      <Btn variant="primary" onClick={handleSubmit} disabled={saving} style={{width:"100%",justifyContent:"center",opacity:saving?0.6:1}}>{saving?"Saving…":"✓ Submit"}</Btn>
+                    </div>
+                  </>
                 ):sec&&sec.matrixOrientation==="byItem"?(
                   <MatrixByItemView section={sec} isDesktop={true} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
                 ):(
@@ -965,8 +1081,14 @@ function DevicePreview({form,onClose}){
                 ))}
                 <button onClick={()=>setActiveSec("summary")} style={{padding:"7px 10px",border:"none",background:"transparent",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",fontFamily:"inherit",color:showSummary?C.indigo:C.textMut,borderBottom:showSummary?`2px solid ${C.indigo}`:"2px solid transparent"}}>📋 Summary</button>
               </div>
-              <div style={{flex:1,overflowY:"auto",padding:showSummary?0:"10px 10px"}}>
-                {showSummary?(
+              <div style={{flex:1,overflowY:"auto",padding:submitted?0:showSummary?0:"10px 10px"}}>
+                {submitted?(
+                  <div style={{textAlign:"center",padding:"60px 20px"}}>
+                    <div style={{fontSize:44,marginBottom:14}}>✅</div>
+                    <div style={{fontSize:15,fontWeight:700,color:C.text,marginBottom:6}}>Submitted</div>
+                    <div style={{fontSize:12,color:C.textSec}}>This result has been saved.</div>
+                  </div>
+                ):showSummary?(
                   <SummaryView form={form} values={values} isDesktop={false}/>
                 ):sec&&sec.matrixOrientation==="byItem"?(
                   <MatrixByItemView section={sec} isDesktop={false} values={values} photos={photos} setPhotos={setPhotos} setVal={setVal} getVal={getVal} handlePhoto={handlePhoto} fileRefs={fileRefs} activeSec={activeSec} totalSections={form.sections.length} setActiveSec={setActiveSec} form={form}/>
@@ -975,16 +1097,21 @@ function DevicePreview({form,onClose}){
                 )}
               </div>
               {/* Bottom nav */}
-              <div style={{background:"#fff",padding:"8px 10px",borderTop:`1px solid ${C.border}`,display:"flex",gap:8,flexShrink:0}}>
-                <button onClick={()=>setActiveSec(showSummary?form.sections.length-1:s=>Math.max(0,s-1))} disabled={!showSummary&&activeSec===0} style={{flex:1,padding:"7px",borderRadius:10,border:`1px solid ${C.border}`,background:"#fff",color:(!showSummary&&activeSec===0)?C.textMut:C.text,cursor:(!showSummary&&activeSec===0)?"default":"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>← Back</button>
-                {showSummary?(
-                  <button onClick={()=>alert("Submitted! (preview mode)")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.green,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>✓ Submit</button>
-                ):activeSec<form.sections.length-1?(
-                  <button onClick={()=>setActiveSec(s=>s+1)} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>Next →</button>
-                ):(
-                  <button onClick={()=>setActiveSec("summary")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>View Summary →</button>
-                )}
-              </div>
+              {!submitted&&(
+                <div style={{background:"#fff",padding:"8px 10px",borderTop:`1px solid ${C.border}`,flexShrink:0}}>
+                  {saveError&&<div style={{fontSize:11,color:C.red,background:C.redLight,border:"1px solid #fca5a5",borderRadius:8,padding:"6px 10px",marginBottom:6}}>⚠ {saveError}</div>}
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>setActiveSec(showSummary?form.sections.length-1:s=>Math.max(0,s-1))} disabled={!showSummary&&activeSec===0} style={{flex:1,padding:"7px",borderRadius:10,border:`1px solid ${C.border}`,background:"#fff",color:(!showSummary&&activeSec===0)?C.textMut:C.text,cursor:(!showSummary&&activeSec===0)?"default":"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>← Back</button>
+                    {showSummary?(
+                      <button onClick={handleSubmit} disabled={saving} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.green,color:"#fff",cursor:saving?"default":"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12,opacity:saving?0.6:1}}>{saving?"Saving…":"✓ Submit"}</button>
+                    ):activeSec<form.sections.length-1?(
+                      <button onClick={()=>setActiveSec(s=>s+1)} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>Next →</button>
+                    ):(
+                      <button onClick={()=>setActiveSec("summary")} style={{flex:2,padding:"7px",borderRadius:10,border:"none",background:C.indigo,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:12}}>View Summary →</button>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1706,6 +1833,7 @@ function LibraryPage({forms,onOpen,onNew,onImport,onDelete}){
   const [showImport,setShowImport]=useState(false);
   const [newTitle,setNewTitle]=useState("");
   const [showNewForm,setShowNewForm]=useState(false);
+  const [submissionsFor,setSubmissionsFor]=useState(null);
 
   const allTags=[...new Set(forms.flatMap(f=>f.tags||[]))];
 
@@ -1803,7 +1931,8 @@ function LibraryPage({forms,onOpen,onNew,onImport,onDelete}){
                         <span>{f.sections?.reduce((a,s)=>a+(s.fields?.length||0),0)||0} checks</span>
                         <span style={{margin:"0 6px"}}>·</span>
                         <span>v{f.version||"1.0"}</span>
-                        <button onClick={e=>{e.stopPropagation();if(window.confirm("Delete this form?"))onDelete(f.id);}} style={{marginLeft:"auto",background:"none",border:"none",cursor:"pointer",color:C.textMut,fontSize:13,padding:2,lineHeight:1}} title="Delete">🗑</button>
+                        <button onClick={e=>{e.stopPropagation();setSubmissionsFor(f);}} style={{marginLeft:"auto",background:"none",border:"none",cursor:"pointer",color:C.textMut,fontSize:11,fontWeight:600,padding:"2px 6px",lineHeight:1}} title="View submissions">📥 Submissions</button>
+                        <button onClick={e=>{e.stopPropagation();if(window.confirm("Delete this form?"))onDelete(f.id);}} style={{background:"none",border:"none",cursor:"pointer",color:C.textMut,fontSize:13,padding:2,lineHeight:1}} title="Delete">🗑</button>
                       </div>
                     </div>
                   </Card>
@@ -1829,6 +1958,7 @@ function LibraryPage({forms,onOpen,onNew,onImport,onDelete}){
       )}
 
       {showImport&&<PdfImportModal onImport={f=>{onImport(f);setShowImport(false);}} onClose={()=>setShowImport(false)}/>}
+      {submissionsFor&&<SubmissionsModal form={submissionsFor} onClose={()=>setSubmissionsFor(null)}/>}
     </div>
   );
 }
